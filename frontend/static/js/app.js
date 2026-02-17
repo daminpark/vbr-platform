@@ -1,4 +1,4 @@
-/* VBR Platform — Owner App (Phase 1a: read-only messaging) */
+/* VBR Platform — Owner App (Phase 1b: AI Draft Replies) */
 
 const API_BASE = '/api';
 
@@ -7,6 +7,11 @@ const state = {
     conversations: [],
     currentReservationId: null,
     currentThread: null,
+    // AI draft state
+    currentDraft: null,      // { draft, confidence, category }
+    draftLoading: false,
+    draftDismissed: false,
+    editingDraft: null,      // tracks AI origin when editing
 };
 
 // ---------------------------------------------------------------------------
@@ -375,6 +380,58 @@ function renderThreadInto(container, showBackButton) {
 
     threadWrap.appendChild(scroll);
 
+    // AI Draft panel (above compose bar)
+    if (state.draftLoading) {
+        const loading = el('div', 'draft-panel');
+        const inner = el('div', 'draft-loading');
+        inner.appendChild(el('div', 'spinner'));
+        inner.appendChild(el('span', '', 'Generating draft...'));
+        loading.appendChild(inner);
+        threadWrap.appendChild(loading);
+    } else if (state.currentDraft && !state.draftDismissed) {
+        const draftPanel = el('div', 'draft-panel');
+
+        // Header: "AI Draft" + confidence badge
+        const draftHeader = el('div', 'draft-header');
+        draftHeader.appendChild(el('span', 'draft-label', 'AI Draft'));
+        if (state.currentDraft.confidence != null) {
+            const pct = Math.round(state.currentDraft.confidence * 100);
+            draftHeader.appendChild(el('span', 'draft-confidence', pct + '%'));
+        }
+        draftPanel.appendChild(draftHeader);
+
+        // Draft body
+        const draftBody = el('div', 'draft-body');
+        draftBody.textContent = state.currentDraft.draft;
+        draftPanel.appendChild(draftBody);
+
+        // Action buttons
+        const draftActions = el('div', 'draft-actions');
+
+        const useBtn = el('button', 'btn btn-sm draft-btn-use', 'Send');
+        useBtn.addEventListener('click', sendDraftAsIs);
+
+        const editBtn = el('button', 'btn btn-sm draft-btn-edit', 'Edit');
+        editBtn.addEventListener('click', editDraft);
+
+        const regenBtn = el('button', 'btn btn-sm draft-btn-regen', 'Regenerate');
+        regenBtn.addEventListener('click', () => generateDraft(state.currentReservationId));
+
+        const dismissBtn = el('button', 'btn btn-sm draft-btn-dismiss', 'Dismiss');
+        dismissBtn.addEventListener('click', () => {
+            state.draftDismissed = true;
+            render();
+        });
+
+        draftActions.appendChild(useBtn);
+        draftActions.appendChild(editBtn);
+        draftActions.appendChild(regenBtn);
+        draftActions.appendChild(dismissBtn);
+        draftPanel.appendChild(draftActions);
+
+        threadWrap.appendChild(draftPanel);
+    }
+
     // Compose bar
     const compose = el('div', 'compose-bar');
     const input = document.createElement('textarea');
@@ -410,6 +467,7 @@ function getMsgClass(msg) {
     if (msg.sender === 'guest') return 'msg-guest';
     if (msg.is_template) return 'msg-template';
     if (msg.ai_auto_sent) return 'msg-ai-auto';
+    if (msg.ai_generated) return 'msg-ai-draft-sent';
     return 'msg-host';
 }
 
@@ -460,6 +518,10 @@ async function loadConversations() {
 async function openThread(reservationId) {
     state.currentReservationId = reservationId;
     state.view = 'thread';
+    state.currentDraft = null;
+    state.draftDismissed = false;
+    state.draftLoading = false;
+    state.editingDraft = null;
 
     // Show loading in the right place
     if (isDesktop()) {
@@ -474,6 +536,13 @@ async function openThread(reservationId) {
         state.currentThread = { reservation: {}, messages: [] };
     }
     render();
+
+    // Auto-generate draft if last message is from guest
+    const msgs = state.currentThread.messages || [];
+    const lastMsg = msgs[msgs.length - 1];
+    if (lastMsg && lastMsg.sender === 'guest' && !lastMsg.is_template) {
+        generateDraft(reservationId);
+    }
 }
 
 async function sendMessage(inputEl) {
@@ -483,10 +552,20 @@ async function sendMessage(inputEl) {
     inputEl.value = '';
     inputEl.style.height = 'auto';
 
+    // Build send payload — check if this was an edited AI draft
+    const sendData = { body };
+    if (state.editingDraft) {
+        sendData.was_edited = true;
+        sendData.original_ai_draft = state.editingDraft.draft;
+        sendData.ai_confidence = state.editingDraft.confidence;
+        sendData.ai_category = state.editingDraft.category;
+        state.editingDraft = null;
+    }
+
     try {
         await api('/conversations/' + state.currentReservationId + '/send', {
             method: 'POST',
-            body: JSON.stringify({ body: body }),
+            body: JSON.stringify(sendData),
         });
         await openThread(state.currentReservationId);
     } catch (e) {
@@ -494,6 +573,76 @@ async function sendMessage(inputEl) {
         alert('Failed to send: ' + e.message);
     }
 }
+
+// ---------------------------------------------------------------------------
+// AI Draft Actions
+// ---------------------------------------------------------------------------
+
+async function generateDraft(reservationId) {
+    state.draftLoading = true;
+    state.currentDraft = null;
+    state.draftDismissed = false;
+    render();
+
+    try {
+        state.currentDraft = await api('/conversations/' + reservationId + '/draft', {
+            method: 'POST',
+        });
+    } catch (e) {
+        console.error('Failed to generate draft:', e);
+        state.currentDraft = null;
+    }
+    state.draftLoading = false;
+    render();
+}
+
+async function sendDraftAsIs() {
+    if (!state.currentDraft || !state.currentReservationId) return;
+
+    const draft = state.currentDraft;
+    state.currentDraft = null;
+    state.draftDismissed = true;
+
+    try {
+        await api('/conversations/' + state.currentReservationId + '/send', {
+            method: 'POST',
+            body: JSON.stringify({
+                body: draft.draft,
+                was_edited: false,
+                original_ai_draft: draft.draft,
+                ai_confidence: draft.confidence,
+                ai_category: draft.category,
+            }),
+        });
+        await openThread(state.currentReservationId);
+    } catch (e) {
+        console.error('Failed to send draft:', e);
+        alert('Failed to send: ' + e.message);
+    }
+}
+
+function editDraft() {
+    if (!state.currentDraft) return;
+    // Store the draft for tracking when they hit send
+    state.editingDraft = state.currentDraft;
+    state.draftDismissed = true;
+    render();
+
+    // Populate the compose textarea after render
+    requestAnimationFrame(() => {
+        const input = document.querySelector('.compose-input');
+        if (input) {
+            input.value = state.editingDraft.draft;
+            input.style.height = 'auto';
+            input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+            input.focus();
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
 
 async function syncAll() {
     const syncBar = el('div', 'sync-bar', 'Syncing listings...');

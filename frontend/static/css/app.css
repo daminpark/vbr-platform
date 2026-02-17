@@ -355,6 +355,116 @@ body {
 .compose-send:active { opacity: 0.8; }
 .compose-send:disabled { opacity: 0.4; }
 
+/* ---- AI Draft Panel ---- */
+
+.draft-panel {
+    padding: 12px 16px;
+    background: var(--green-dim);
+    border-top: 1px solid rgba(52, 211, 153, 0.3);
+    flex-shrink: 0;
+}
+
+.draft-loading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--green);
+    font-size: 0.85rem;
+    padding: 4px 0;
+}
+
+.draft-loading .spinner {
+    border-top-color: var(--green);
+}
+
+.draft-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.draft-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--green);
+}
+
+.draft-confidence {
+    font-size: 0.65rem;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: rgba(52, 211, 153, 0.2);
+    color: var(--green);
+    font-weight: 600;
+}
+
+.draft-body {
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: var(--text);
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(52, 211, 153, 0.2);
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+}
+
+.draft-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.draft-btn-use {
+    background: var(--green) !important;
+    color: #000 !important;
+}
+
+.draft-btn-edit {
+    background: var(--accent) !important;
+    color: #fff !important;
+}
+
+.draft-btn-regen {
+    background: transparent !important;
+    color: var(--green) !important;
+    border: 1px solid rgba(52, 211, 153, 0.3) !important;
+}
+
+.draft-btn-dismiss {
+    background: transparent !important;
+    color: var(--text-muted) !important;
+}
+
+/* AI-drafted message that was sent (human-approved) */
+.msg-ai-draft-sent {
+    align-self: flex-end;
+    background: var(--accent);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+    position: relative;
+}
+
+.msg-ai-draft-sent::after {
+    content: 'AI';
+    position: absolute;
+    top: -8px;
+    right: 8px;
+    font-size: 0.55rem;
+    font-weight: 700;
+    background: var(--green);
+    color: #000;
+    padding: 1px 5px;
+    border-radius: 4px;
+    letter-spacing: 0.03em;
+}
+
+.msg-ai-draft-sent .msg-time { color: rgba(255,255,255,0.6); }
+
 /* ---- Sync / Loading ---- */
 
 .sync-bar {
@@ -480,5 +590,22 @@ body {
 
     .header-back {
         display: none; /* no back button on desktop */
+    }
+}
+
+/* ---- Mobile: smaller draft panel ---- */
+@media (max-width: 767px) {
+    .draft-panel {
+        padding: 10px 12px;
+    }
+    .draft-body {
+        font-size: 0.85rem;
+    }
+    .draft-actions {
+        gap: 4px;
+    }
+    .draft-actions .btn {
+        padding: 6px 10px;
+        font-size: 0.72rem;
     }
 }

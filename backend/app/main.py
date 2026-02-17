@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router, set_services
 from app.core.config import settings
 from app.db.database import init_db
+from app.services.ai_drafter import AIDrafter
 from app.services.hosttools import HostToolsClient
 from app.services.ntfy import NtfyClient
 
@@ -57,8 +58,16 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("ntfy not configured — notifications disabled")
 
+    # Init AI drafter
+    ai_drafter = None
+    if settings.gemini_api_key:
+        ai_drafter = AIDrafter(settings.gemini_api_key)
+        logger.info("AI Drafter initialized (model: gemini-2.0-flash)")
+    else:
+        logger.warning("GEMINI_API_KEY not set — AI drafts disabled")
+
     # Wire up services to routes
-    set_services(hosttools, ntfy)
+    set_services(hosttools, ntfy, ai_drafter)
 
     logger.info("VBR Platform started successfully")
     yield

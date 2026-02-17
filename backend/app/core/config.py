@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     # Host Tools API
     hosttools_auth_token: str = ""
 
-    # Anthropic Claude API
-    anthropic_api_key: str = ""
+    # Google Gemini API
+    gemini_api_key: str = ""
 
     # Database (SQLite for local dev, PostgreSQL for production)
     database_url: str = "sqlite+aiosqlite:///./vbr.db"

@@ -11,7 +11,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_session
-from app.db.models import Listing, Reservation, Message
+from app.db.models import Listing, Reservation, Message, KnowledgeEntry
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +20,14 @@ router = APIRouter()
 # Will be set from main.py on startup
 _hosttools = None
 _ntfy = None
+_ai_drafter = None
 
 
-def set_services(hosttools, ntfy):
-    global _hosttools, _ntfy
+def set_services(hosttools, ntfy, ai_drafter=None):
+    global _hosttools, _ntfy, _ai_drafter
     _hosttools = hosttools
     _ntfy = ntfy
+    _ai_drafter = ai_drafter
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +529,8 @@ class SendMessageRequest(BaseModel):
     body: str
     was_edited: bool = False
     original_ai_draft: Optional[str] = None
+    ai_confidence: Optional[float] = None
+    ai_category: Optional[str] = None
 
 
 @router.post("/conversations/{reservation_id}/send")
@@ -558,12 +562,129 @@ async def send_message(reservation_id: int, req: SendMessageRequest):
             body=req.body,
             is_sent=True,
             ai_generated=req.original_ai_draft is not None,
+            ai_confidence=req.ai_confidence,
             was_edited=req.was_edited,
             original_ai_draft=req.original_ai_draft,
         )
         session.add(message)
 
     return {"sent": True, "message_id": message.id}
+
+
+# ---------------------------------------------------------------------------
+# AI Drafts
+# ---------------------------------------------------------------------------
+
+@router.post("/conversations/{reservation_id}/draft")
+async def generate_draft(reservation_id: int):
+    """Generate an AI draft reply for a conversation."""
+    if not _ai_drafter:
+        raise HTTPException(status_code=503, detail="AI not configured (GEMINI_API_KEY not set)")
+
+    async with get_session() as session:
+        try:
+            result = await _ai_drafter.generate_draft(session, reservation_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("AI draft generation failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="AI generation failed")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base
+# ---------------------------------------------------------------------------
+
+class KnowledgeEntryRequest(BaseModel):
+    category: str
+    question: Optional[str] = None
+    answer: str
+
+
+@router.get("/knowledge")
+async def get_knowledge(category: Optional[str] = None):
+    """Get knowledge base entries, optionally filtered by category."""
+    async with get_session() as session:
+        query = select(KnowledgeEntry).where(KnowledgeEntry.active == True)
+        if category:
+            query = query.where(KnowledgeEntry.category == category)
+        query = query.order_by(KnowledgeEntry.category, KnowledgeEntry.id)
+        result = await session.execute(query)
+        entries = result.scalars().all()
+        return [
+            {
+                "id": e.id,
+                "category": e.category,
+                "question": e.question,
+                "answer": e.answer,
+                "source": e.source,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in entries
+        ]
+
+
+@router.post("/knowledge")
+async def create_knowledge(req: KnowledgeEntryRequest):
+    """Create a new knowledge base entry."""
+    async with get_session() as session:
+        entry = KnowledgeEntry(
+            category=req.category,
+            question=req.question,
+            answer=req.answer,
+            source="manual",
+            active=True,
+        )
+        session.add(entry)
+        await session.flush()
+        return {"id": entry.id, "created": True}
+
+
+@router.put("/knowledge/{entry_id}")
+async def update_knowledge(entry_id: int, req: KnowledgeEntryRequest):
+    """Update a knowledge base entry."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(KnowledgeEntry).where(KnowledgeEntry.id == entry_id)
+        )
+        entry = result.scalar_one_or_none()
+        if not entry:
+            raise HTTPException(status_code=404, detail="Entry not found")
+        entry.category = req.category
+        entry.question = req.question
+        entry.answer = req.answer
+        return {"id": entry.id, "updated": True}
+
+
+@router.delete("/knowledge/{entry_id}")
+async def delete_knowledge(entry_id: int):
+    """Soft-delete a knowledge base entry."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(KnowledgeEntry).where(KnowledgeEntry.id == entry_id)
+        )
+        entry = result.scalar_one_or_none()
+        if not entry:
+            raise HTTPException(status_code=404, detail="Entry not found")
+        entry.active = False
+        return {"id": entry_id, "deleted": True}
+
+
+class ImportKnowledgeRequest(BaseModel):
+    json_data: dict
+    replace: bool = True
+
+
+@router.post("/knowledge/import")
+async def import_knowledge(req: ImportKnowledgeRequest):
+    """Bulk import knowledge from 195vbr en.json data."""
+    from app.services.knowledge_importer import import_from_en_json
+
+    async with get_session() as session:
+        count = await import_from_en_json(session, req.json_data, req.replace)
+    return {"imported": count}
 
 
 # ---------------------------------------------------------------------------
@@ -656,4 +777,5 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "hosttools_configured": bool(_hosttools and _hosttools.auth_token),
         "ntfy_configured": bool(_ntfy and _ntfy.configured),
+        "ai_configured": bool(_ai_drafter),
     }
