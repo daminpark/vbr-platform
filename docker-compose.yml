@@ -1,0 +1,16 @@
+services:
+  vbr:
+    build: .
+    container_name: vbr
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - vbr-data:/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////data/vbr.db
+
+volumes:
+  vbr-data:

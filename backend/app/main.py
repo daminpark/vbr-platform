@@ -16,9 +16,12 @@ from app.services.ai_drafter import AIDrafter
 from app.services.hosttools import HostToolsClient
 from app.services.ntfy import NtfyClient
 
-# Paths
-BASE_DIR = Path(__file__).parent.parent.parent  # vbr-platform/
-FRONTEND_DIR = BASE_DIR / "frontend"
+# Paths — works both locally (backend/app/main.py → ../../frontend)
+# and in Docker (/app/app/main.py → ../frontend)
+_app_dir = Path(__file__).parent.parent  # backend/ or /app/
+FRONTEND_DIR = _app_dir / "frontend"
+if not FRONTEND_DIR.exists():
+    FRONTEND_DIR = _app_dir.parent / "frontend"  # local dev: go up one more
 STATIC_DIR = FRONTEND_DIR / "static"
 TEMPLATES_DIR = FRONTEND_DIR / "templates"
 
