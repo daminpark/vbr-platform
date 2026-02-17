@@ -1,8 +1,9 @@
-"""PIN-based authentication with signed cookies."""
+"""PIN-based authentication with signed cookies and rate limiting."""
 
 import hashlib
 import hmac
 import time
+from collections import defaultdict
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,9 +14,35 @@ from app.core.config import settings
 COOKIE_NAME = "vbr_session"
 COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
 
+# Rate limiting: max 5 failed attempts per IP, then locked for 15 minutes
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 15 * 60
+_failed_attempts: dict[str, list[float]] = defaultdict(list)
+
 # Paths that don't require authentication
 PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/check"}
 PUBLIC_PREFIXES = ("/api/webhooks/",)
+
+
+def check_rate_limit(ip: str) -> int | None:
+    """Check if IP is rate-limited. Returns seconds until unlock, or None if OK."""
+    now = time.time()
+    # Clean old attempts
+    _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < LOCKOUT_SECONDS]
+    if len(_failed_attempts[ip]) >= MAX_ATTEMPTS:
+        oldest = _failed_attempts[ip][0]
+        return int(LOCKOUT_SECONDS - (now - oldest))
+    return None
+
+
+def record_failed_attempt(ip: str):
+    """Record a failed login attempt."""
+    _failed_attempts[ip].append(time.time())
+
+
+def clear_attempts(ip: str):
+    """Clear failed attempts on successful login."""
+    _failed_attempts.pop(ip, None)
 
 
 def _sign(value: str) -> str:

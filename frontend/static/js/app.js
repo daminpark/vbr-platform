@@ -161,7 +161,8 @@ async function doLogin(input, errorEl) {
             body: JSON.stringify({ pin }),
         });
         if (!resp.ok) {
-            errorEl.textContent = 'Invalid PIN';
+            const err = await resp.json().catch(() => ({}));
+            errorEl.textContent = err.detail || 'Invalid PIN';
             input.value = '';
             input.focus();
             return;

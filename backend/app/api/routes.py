@@ -39,18 +39,31 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/auth/login")
-async def login(req: LoginRequest, response: Response):
+async def login(req: LoginRequest, request: Request, response: Response):
     """Authenticate with PIN and set session cookie."""
-    from app.core.auth import create_session_cookie, COOKIE_NAME, COOKIE_MAX_AGE
+    from app.core.auth import (
+        create_session_cookie, COOKIE_NAME, COOKIE_MAX_AGE,
+        check_rate_limit, record_failed_attempt, clear_attempts,
+    )
     from app.core.config import settings
+
+    ip = request.headers.get("cf-connecting-ip") or request.client.host
+    wait = check_rate_limit(ip)
+    if wait is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many attempts. Try again in {wait // 60 + 1} minutes.",
+        )
 
     if req.pin == settings.owner_pin:
         role = "owner"
     elif req.pin == settings.cleaner_pin:
         role = "cleaner"
     else:
+        record_failed_attempt(ip)
         raise HTTPException(status_code=401, detail="Invalid PIN")
 
+    clear_attempts(ip)
     cookie_value = create_session_cookie(role)
     response.set_cookie(
         COOKIE_NAME,
