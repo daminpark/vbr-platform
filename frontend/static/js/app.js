@@ -166,6 +166,42 @@ function renderMobileLayout() {
 // Render: Conversation Items (shared between mobile & desktop)
 // ---------------------------------------------------------------------------
 
+function shortListingName(name) {
+    if (!name) return '';
+    // "3.1 · Room 1: The Regency | Ground Floor | Victoria" → "Room 1 · 193"
+    // "193VBR · The Tachbrook: 6-Bed Historic Townhouse | Victoria" → "Whole 193"
+    // "193195VBR · The Rochester: Two Townhouses, 12-Bed | Victoria" → "Both Houses"
+    const lower = name.toLowerCase();
+    if (lower.includes('193195') || lower.includes('rochester')) return 'Both Houses';
+
+    // Detect house
+    let house = '';
+    const prefix = name.split(' ')[0].split('·')[0].trim();
+    if (prefix.startsWith('3.') || prefix.startsWith('193')) house = '193';
+    else if (prefix.startsWith('5.') || prefix.startsWith('195')) house = '195';
+
+    // Whole house
+    if (lower.includes('tachbrook') || lower.includes('warwick')) return 'Whole ' + house;
+
+    // Suite
+    if (lower.includes('suite')) {
+        if (lower.includes('3-bed')) return '3-Bed Suite · ' + house;
+        if (lower.includes('2-bed')) return '2-Bed Suite · ' + house;
+        return 'Suite · ' + house;
+    }
+
+    // Room — extract room number
+    const roomMatch = name.match(/Room (\d+)/i);
+    if (roomMatch) {
+        return 'Rm ' + roomMatch[1] + ' · ' + house;
+    }
+
+    // Berlin or other
+    if (lower.includes('berlin')) return 'Berlin';
+
+    return name.length > 25 ? name.substring(0, 22) + '...' : name;
+}
+
 function renderConversationItems(list) {
     if (state.conversations.length === 0) {
         const empty = el('div', 'empty-state');
@@ -216,7 +252,7 @@ function renderConversationItems(list) {
             meta.appendChild(el('span', 'conv-badge badge-attention', 'Needs reply'));
         }
         if (conv.listing_name) {
-            meta.appendChild(el('span', 'conv-badge badge-listing', conv.listing_name));
+            meta.appendChild(el('span', 'conv-badge badge-listing', shortListingName(conv.listing_name)));
         }
         if (conv.platform) {
             meta.appendChild(el('span', 'conv-badge badge-platform', conv.platform));

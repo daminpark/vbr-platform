@@ -182,8 +182,8 @@ body {
 }
 
 .badge-attention {
-    background: var(--orange-dim);
-    color: var(--orange);
+    background: var(--red-dim);
+    color: var(--red);
 }
 
 .badge-platform {
@@ -194,6 +194,8 @@ body {
 .badge-listing {
     background: var(--accent-dim);
     color: var(--accent-light);
+    text-transform: none;
+    letter-spacing: normal;
 }
 
 .unread-dot {

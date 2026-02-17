@@ -54,6 +54,20 @@ async def get_listings():
         ]
 
 
+def _detect_house_code(name: str) -> str | None:
+    """Detect house code from listing name. '3.x' or '193' = 193, '5.x' or '195' = 195."""
+    if not name:
+        return None
+    prefix = name.split(" ")[0].split("·")[0].strip().upper()
+    if prefix.startswith("3.") or prefix.startswith("193"):
+        return "193"
+    if prefix.startswith("5.") or prefix.startswith("195"):
+        return "195"
+    if "193195" in prefix or "ROCHESTER" in name.upper():
+        return "both"
+    return None
+
+
 @router.post("/sync/listings")
 async def sync_listings():
     """Pull listings from Host Tools and sync to DB."""
@@ -75,10 +89,12 @@ async def sync_listings():
             listing = result.scalar_one_or_none()
 
             name = raw.get("nickname") or raw.get("name") or raw.get("title", "Unknown")
+            house_code = _detect_house_code(name)
 
             if listing:
                 listing.name = name
                 listing.platform = raw.get("source") or raw.get("platform")
+                listing.house_code = house_code
                 listing.picture_url = raw.get("picture") or raw.get("thumbnail")
                 listing.raw_data = json.dumps(raw, default=str)
                 listing.last_synced = datetime.utcnow()
@@ -87,6 +103,7 @@ async def sync_listings():
                     hosttools_id=ht_id,
                     name=name,
                     platform=raw.get("source") or raw.get("platform"),
+                    house_code=house_code,
                     picture_url=raw.get("picture") or raw.get("thumbnail"),
                     raw_data=json.dumps(raw, default=str),
                     last_synced=datetime.utcnow(),
@@ -146,9 +163,30 @@ async def get_reservations(
         ]
 
 
+def _parse_num_guests(raw_value) -> int:
+    """Parse num_guests from Host Tools — can be int, dict, or None."""
+    if raw_value is None:
+        return 1
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, dict):
+        # Host Tools sometimes returns {"children": 0, "infants": 0, "pets": 0}
+        # The total adults is often in a separate field, default to 1
+        adults = raw_value.get("adults", 1)
+        children = raw_value.get("children", 0)
+        return adults + children if isinstance(adults, int) else 1
+    try:
+        return int(raw_value)
+    except (ValueError, TypeError):
+        return 1
+
+
 @router.post("/sync/reservations")
 async def sync_reservations():
-    """Pull reservations from Host Tools for all listings and sync to DB."""
+    """Pull reservations from Host Tools for all listings and sync to DB.
+
+    Also extracts any embedded messages from reservation data.
+    """
     if not _hosttools:
         raise HTTPException(status_code=503, detail="Host Tools not configured")
 
@@ -160,6 +198,7 @@ async def sync_reservations():
             return {"error": "No listings synced yet. Run /api/sync/listings first."}
 
         total_synced = 0
+        total_messages = 0
         start = (date.today() - timedelta(days=30)).isoformat()
         end = (date.today() + timedelta(days=365)).isoformat()
 
@@ -194,10 +233,21 @@ async def sync_reservations():
                 if isinstance(check_out, str):
                     check_out = datetime.fromisoformat(check_out.replace("Z", "+00:00"))
 
-                guest_name = raw.get("guestName") or raw.get("guest", {}).get("name", "Unknown")
-                guest_phone = raw.get("guestPhone") or raw.get("guest", {}).get("phone")
-                guest_email = raw.get("guestEmail") or raw.get("guest", {}).get("email")
-                guest_pic = raw.get("guestPicture") or raw.get("guest", {}).get("picture")
+                # Parse guest info — Host Tools uses firstName/lastName at top level
+                first = raw.get("firstName", "")
+                last = raw.get("lastName", "")
+                guest_name = f"{first} {last}".strip() or raw.get("guestName") or "Unknown"
+                guest_phone = raw.get("phone") or raw.get("guestPhone")
+                guest_email = raw.get("email") or raw.get("guestEmail")
+                guest_pic = raw.get("guestPicture") or raw.get("guestPictureUrl")
+
+                # Parse num_guests safely
+                num_guests = _parse_num_guests(
+                    raw.get("numberOfGuests") or raw.get("guests") or raw.get("guestCount")
+                )
+
+                platform = raw.get("source") or raw.get("platform") or raw.get("channelName") or "unknown"
+                status = raw.get("status") or "confirmed"
 
                 if reservation:
                     reservation.guest_name = guest_name
@@ -206,9 +256,9 @@ async def sync_reservations():
                     reservation.guest_picture_url = guest_pic
                     reservation.check_in = check_in
                     reservation.check_out = check_out
-                    reservation.num_guests = raw.get("numberOfGuests") or raw.get("guests")
-                    reservation.platform = raw.get("source") or raw.get("platform")
-                    reservation.status = raw.get("status", "confirmed")
+                    reservation.num_guests = num_guests
+                    reservation.platform = platform
+                    reservation.status = status
                     reservation.raw_data = json.dumps(raw, default=str)
                     reservation.last_synced = datetime.utcnow()
                 else:
@@ -221,17 +271,78 @@ async def sync_reservations():
                         guest_picture_url=guest_pic,
                         check_in=check_in,
                         check_out=check_out,
-                        num_guests=raw.get("numberOfGuests") or raw.get("guests"),
-                        platform=raw.get("source") or raw.get("platform"),
-                        status=raw.get("status", "confirmed"),
+                        num_guests=num_guests,
+                        platform=platform,
+                        status=status,
                         raw_data=json.dumps(raw, default=str),
                         last_synced=datetime.utcnow(),
                     )
                     session.add(reservation)
 
+                # Flush to get reservation.id for message linking
+                await session.flush()
+
+                # Extract messages from 'posts' (Host Tools terminology)
+                posts = raw.get("posts") or raw.get("messages") or raw.get("thread") or []
+                if isinstance(posts, list):
+                    for msg_raw in posts:
+                        msg_body = msg_raw.get("message") or msg_raw.get("body") or msg_raw.get("text", "")
+                        if not msg_body:
+                            continue
+
+                        # Determine sender — Host Tools uses isGuest boolean
+                        is_guest = msg_raw.get("isGuest", False)
+                        role = msg_raw.get("role", "")
+                        sender = "guest" if is_guest or role == "guest" else "host"
+
+                        # Parse message timestamp
+                        msg_time = msg_raw.get("sentTimestamp") or msg_raw.get("createdAt") or msg_raw.get("timestamp")
+                        if msg_time and isinstance(msg_time, str):
+                            try:
+                                msg_time = datetime.fromisoformat(msg_time.replace("Z", "+00:00"))
+                            except ValueError:
+                                msg_time = datetime.utcnow()
+                        elif not msg_time:
+                            msg_time = datetime.utcnow()
+
+                        # Dedup by reservation + hosttools message ID or timestamp + sender
+                        ht_msg_id = msg_raw.get("_id", "")
+                        if ht_msg_id:
+                            existing = await session.execute(
+                                select(Message).where(
+                                    and_(
+                                        Message.reservation_id == reservation.id,
+                                        Message.hosttools_id == ht_msg_id,
+                                    )
+                                )
+                            )
+                        else:
+                            existing = await session.execute(
+                                select(Message).where(
+                                    and_(
+                                        Message.reservation_id == reservation.id,
+                                        Message.timestamp == msg_time,
+                                        Message.sender == sender,
+                                    )
+                                )
+                            )
+                        if existing.scalar_one_or_none():
+                            continue
+
+                        message = Message(
+                            reservation_id=reservation.id,
+                            hosttools_id=ht_msg_id or None,
+                            timestamp=msg_time,
+                            sender=sender,
+                            body=msg_body,
+                            is_sent=True,
+                        )
+                        session.add(message)
+                        total_messages += 1
+
                 total_synced += 1
 
-    return {"synced": total_synced}
+    return {"synced": total_synced, "messages_imported": total_messages}
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +350,13 @@ async def sync_reservations():
 # ---------------------------------------------------------------------------
 
 @router.get("/conversations")
-async def get_conversations():
-    """Get all conversations (reservations with messages), ordered by most recent message.
+async def get_conversations(include_empty: bool = False):
+    """Get conversations ordered by most recent message.
 
-    Returns conversation summaries with unread status.
+    By default only returns reservations that have messages.
+    Set include_empty=true to also show reservations without messages.
     """
     async with get_session() as session:
-        # Get reservations that have messages, plus active reservations
         today = date.today()
         query = (
             select(Reservation)
@@ -260,6 +371,10 @@ async def get_conversations():
         for r in reservations:
             messages = sorted(r.messages, key=lambda m: m.timestamp, reverse=True)
             last_msg = messages[0] if messages else None
+
+            # Skip reservations without messages unless requested
+            if not include_empty and not messages:
+                continue
 
             # "needs attention" = last message is from guest and no host/AI reply after it
             needs_attention = False
@@ -288,16 +403,12 @@ async def get_conversations():
                 "message_count": len(messages),
             })
 
-        # Sort: needs_attention first, then by last message time
+        # Sort: needs_attention first, then by most recent message
         conversations.sort(
             key=lambda c: (
                 not c["needs_attention"],
-                c["last_message_time"] or "0",
+                -(datetime.fromisoformat(c["last_message_time"]).timestamp() if c["last_message_time"] else 0),
             )
-        )
-        # Reverse the time sort within each group so newest is first
-        conversations.sort(
-            key=lambda c: (not c["needs_attention"], -(datetime.fromisoformat(c["last_message_time"]).timestamp() if c["last_message_time"] else 0))
         )
 
         return conversations
