@@ -19,13 +19,13 @@ router = APIRouter()
 
 # Will be set from main.py on startup
 _hosttools = None
-_pushover = None
+_ntfy = None
 
 
-def set_services(hosttools, pushover):
-    global _hosttools, _pushover
+def set_services(hosttools, ntfy):
+    global _hosttools, _ntfy
     _hosttools = hosttools
-    _pushover = pushover
+    _ntfy = ntfy
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +182,11 @@ def _parse_num_guests(raw_value) -> int:
 
 
 @router.post("/sync/reservations")
-async def sync_reservations():
+async def sync_reservations(full_history: bool = False):
     """Pull reservations from Host Tools for all listings and sync to DB.
 
     Also extracts any embedded messages from reservation data.
+    Set full_history=true to pull all data back to 2024 (first run / backfill).
     """
     if not _hosttools:
         raise HTTPException(status_code=503, detail="Host Tools not configured")
@@ -199,7 +200,10 @@ async def sync_reservations():
 
         total_synced = 0
         total_messages = 0
-        start = (date.today() - timedelta(days=30)).isoformat()
+        if full_history:
+            start = "2025-10-01"
+        else:
+            start = (date.today() - timedelta(days=30)).isoformat()
         end = (date.today() + timedelta(days=365)).isoformat()
 
         for listing in listings:
@@ -558,16 +562,16 @@ async def webhook_message(payload: WebhookMessagePayload):
         session.add(message)
 
     # Send Pushover notification
-    if _pushover:
-        from app.services.pushover import is_emergency_message
+    if _ntfy:
+        from app.services.ntfy import is_emergency_message
 
         if is_emergency_message(payload.message):
-            await _pushover.notify_emergency(
+            await _ntfy.notify_emergency(
                 guest_name=payload.guestName or reservation.guest_name,
                 message_text=payload.message,
             )
         else:
-            await _pushover.notify_new_message(
+            await _ntfy.notify_new_message(
                 guest_name=payload.guestName or reservation.guest_name,
                 message_preview=payload.message,
             )
@@ -602,5 +606,5 @@ async def health_check():
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
         "hosttools_configured": bool(_hosttools and _hosttools.auth_token),
-        "pushover_configured": bool(_pushover and _pushover.app_token),
+        "ntfy_configured": bool(_ntfy and _ntfy.configured),
     }

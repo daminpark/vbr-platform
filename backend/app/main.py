@@ -13,7 +13,7 @@ from app.api.routes import router as api_router, set_services
 from app.core.config import settings
 from app.db.database import init_db
 from app.services.hosttools import HostToolsClient
-from app.services.pushover import PushoverClient
+from app.services.ntfy import NtfyClient
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent.parent  # vbr-platform/
@@ -30,13 +30,13 @@ logger = logging.getLogger(__name__)
 
 # Global services
 hosttools: HostToolsClient | None = None
-pushover: PushoverClient | None = None
+ntfy: NtfyClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown."""
-    global hosttools, pushover
+    global hosttools, ntfy
 
     logger.info("Starting VBR Platform...")
 
@@ -50,15 +50,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("HOSTTOOLS_AUTH_TOKEN not set — API calls will fail")
 
-    # Init Pushover client
-    if settings.pushover_app_token and settings.pushover_user_key:
-        pushover = PushoverClient(settings.pushover_app_token, settings.pushover_user_key)
-        logger.info("Pushover notifications initialized")
+    # Init ntfy client
+    ntfy = NtfyClient(settings.ntfy_url, settings.ntfy_topic, settings.ntfy_token)
+    if ntfy.configured:
+        logger.info("ntfy notifications initialized (%s/%s)", settings.ntfy_url, settings.ntfy_topic)
     else:
-        logger.warning("Pushover not configured — notifications disabled")
+        logger.warning("ntfy not configured — notifications disabled")
 
     # Wire up services to routes
-    set_services(hosttools, pushover)
+    set_services(hosttools, ntfy)
 
     logger.info("VBR Platform started successfully")
     yield
@@ -67,8 +67,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down VBR Platform...")
     if hosttools:
         await hosttools.close()
-    if pushover:
-        await pushover.close()
+    if ntfy:
+        await ntfy.close()
     logger.info("Shutdown complete")
 
 

@@ -20,13 +20,14 @@ class Settings(BaseSettings):
     owner_pin: str = "1234"
     cleaner_pin: str = "1234"  # Same as master code
 
-    # Pushover notifications
-    pushover_app_token: str = ""
-    pushover_user_key: str = ""
+    # ntfy.sh notifications (self-hosted)
+    ntfy_url: str = ""  # e.g. https://ntfy.yourdomain.com
+    ntfy_topic: str = "vbr"  # notification topic name
+    ntfy_token: str = ""  # access token if auth enabled
 
     # Home Assistant (Rental Manager) via Tailscale
-    ha_195_url: str = "http://100.70.238.75:8099"
-    ha_193_url: str = "http://100.65.13.40:8099"
+    ha_195_url: str = ""  # Set in .env
+    ha_193_url: str = ""  # Set in .env
 
     # Server
     host: str = "0.0.0.0"
