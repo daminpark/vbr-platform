@@ -1,0 +1,121 @@
+"""Main application entry point for VBR Platform."""
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.api.routes import router as api_router, set_services
+from app.core.config import settings
+from app.db.database import init_db
+from app.services.hosttools import HostToolsClient
+from app.services.pushover import PushoverClient
+
+# Paths
+BASE_DIR = Path(__file__).parent.parent.parent  # vbr-platform/
+FRONTEND_DIR = BASE_DIR / "frontend"
+STATIC_DIR = FRONTEND_DIR / "static"
+TEMPLATES_DIR = FRONTEND_DIR / "templates"
+
+# Logging
+logging.basicConfig(
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Global services
+hosttools: HostToolsClient | None = None
+pushover: PushoverClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan — startup and shutdown."""
+    global hosttools, pushover
+
+    logger.info("Starting VBR Platform...")
+
+    # Init database
+    await init_db()
+
+    # Init Host Tools client
+    if settings.hosttools_auth_token:
+        hosttools = HostToolsClient(settings.hosttools_auth_token)
+        logger.info("Host Tools API client initialized")
+    else:
+        logger.warning("HOSTTOOLS_AUTH_TOKEN not set — API calls will fail")
+
+    # Init Pushover client
+    if settings.pushover_app_token and settings.pushover_user_key:
+        pushover = PushoverClient(settings.pushover_app_token, settings.pushover_user_key)
+        logger.info("Pushover notifications initialized")
+    else:
+        logger.warning("Pushover not configured — notifications disabled")
+
+    # Wire up services to routes
+    set_services(hosttools, pushover)
+
+    logger.info("VBR Platform started successfully")
+    yield
+
+    # Shutdown
+    logger.info("Shutting down VBR Platform...")
+    if hosttools:
+        await hosttools.close()
+    if pushover:
+        await pushover.close()
+    logger.info("Shutdown complete")
+
+
+app = FastAPI(
+    title="VBR Platform",
+    description="Property management platform for 193 & 195 Vauxhall Bridge Road",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API routes
+app.include_router(api_router, prefix="/api")
+
+# Static files
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# Dashboard
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the owner app."""
+    index_path = TEMPLATES_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return HTMLResponse("<h1>VBR Platform</h1><p>Frontend not built yet.</p>")
+
+
+def main():
+    """Run the application."""
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug,
+    )
+
+
+if __name__ == "__main__":
+    main()
