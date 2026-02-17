@@ -124,11 +124,9 @@ function renderLogin() {
 
     const input = document.createElement('input');
     input.type = 'password';
-    input.inputMode = 'numeric';
-    input.pattern = '[0-9]*';
     input.className = 'login-input';
     input.placeholder = 'PIN';
-    input.maxLength = 10;
+    input.maxLength = 20;
     input.autocomplete = 'off';
     form.appendChild(input);
 
@@ -343,6 +341,15 @@ function renderConversationItems(list) {
         const meta = el('div', 'conv-meta');
         if (conv.needs_attention) {
             meta.appendChild(el('span', 'conv-badge badge-attention', 'Needs reply'));
+        }
+        // Guest status badge
+        if (conv.guest_status === 'current') {
+            meta.appendChild(el('span', 'conv-badge badge-current', 'Current'));
+        } else if (conv.guest_status === 'future') {
+            const label = conv.status_detail === 'today' ? 'Today' : 'In ' + conv.status_detail;
+            meta.appendChild(el('span', 'conv-badge badge-future', label));
+        } else if (conv.guest_status === 'past') {
+            meta.appendChild(el('span', 'conv-badge badge-past', conv.status_detail || 'Past'));
         }
         if (conv.listing_name) {
             meta.appendChild(el('span', 'conv-badge badge-listing', shortListingName(conv.listing_name)));

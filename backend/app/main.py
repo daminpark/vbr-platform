@@ -1,5 +1,6 @@
 """Main application entry point for VBR Platform."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -73,16 +74,54 @@ async def lifespan(app: FastAPI):
     # Wire up services to routes
     set_services(hosttools, ntfy, ai_drafter)
 
+    # Start background sync task
+    sync_task = None
+    if hosttools and settings.hosttools_poll_interval > 0:
+        sync_task = asyncio.create_task(_background_sync(settings.hosttools_poll_interval))
+        logger.info("Background sync started (every %ds)", settings.hosttools_poll_interval)
+
+    # Start template scheduler
+    template_task = None
+    if hosttools:
+        from app.services.template_scheduler import template_scheduler_loop
+        template_task = asyncio.create_task(template_scheduler_loop(hosttools))
+        logger.info("Template scheduler started (all templates disabled by default)")
+
     logger.info("VBR Platform started successfully")
     yield
 
     # Shutdown
+    for task in [sync_task, template_task]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     logger.info("Shutting down VBR Platform...")
     if hosttools:
         await hosttools.close()
     if ntfy:
         await ntfy.close()
     logger.info("Shutdown complete")
+
+
+async def _background_sync(interval: int):
+    """Background task to auto-sync reservations from Host Tools."""
+    await asyncio.sleep(30)  # Wait 30s after startup before first sync
+    while True:
+        try:
+            from app.api.routes import sync_listings, sync_reservations
+            await sync_listings()
+            result = await sync_reservations()
+            logger.info(
+                "Background sync: %s reservations, %s messages",
+                result.get("synced", 0),
+                result.get("messages_imported", 0),
+            )
+        except Exception as e:
+            logger.error("Background sync failed: %s", e)
+        await asyncio.sleep(interval)
 
 
 app = FastAPI(

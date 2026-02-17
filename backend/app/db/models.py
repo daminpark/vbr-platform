@@ -145,3 +145,35 @@ class AutoReplyCategory(Base):
     never_auto_reply: Mapped[bool] = mapped_column(Boolean, default=False)  # flagged categories
     enabled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled message templates
+# ---------------------------------------------------------------------------
+
+class MessageTemplate(Base):
+    """A scheduled message template (e.g., check-in instructions, checkout reminder)."""
+
+    __tablename__ = "message_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    trigger: Mapped[str] = mapped_column(String(50))  # checkin_day, checkout_day, day_before_checkin, etc.
+    body: Mapped[str] = mapped_column(Text)  # supports {guest_name}, {check_in}, {listing_name}, etc.
+    hours_offset: Mapped[int] = mapped_column(Integer, default=14)  # hour of day to send (e.g., 14 = 2pm)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    house_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # "193", "195", or null=both
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ScheduledMessageLog(Base):
+    """Log of sent scheduled messages — prevents duplicates."""
+
+    __tablename__ = "scheduled_message_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    template_id: Mapped[int] = mapped_column(ForeignKey("message_templates.id"), index=True)
+    reservation_id: Mapped[int] = mapped_column(ForeignKey("reservations.id"), index=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    body_sent: Mapped[str] = mapped_column(Text)  # actual body after placeholder substitution

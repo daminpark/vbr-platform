@@ -11,7 +11,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_session
-from app.db.models import Listing, Reservation, Message, KnowledgeEntry
+from app.db.models import Listing, Reservation, Message, KnowledgeEntry, MessageTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +506,21 @@ async def get_conversations(include_empty: bool = False):
             # Count unreviewed AI drafts
             pending_drafts = sum(1 for m in messages if m.is_draft and not m.is_sent)
 
+            # Guest status: current / future / past
+            check_in_date = r.check_in.date() if isinstance(r.check_in, datetime) else r.check_in
+            check_out_date = r.check_out.date() if isinstance(r.check_out, datetime) else r.check_out
+            if check_in_date <= today <= check_out_date:
+                guest_status = "current"
+                status_detail = None
+            elif check_in_date > today:
+                guest_status = "future"
+                days_until = (check_in_date - today).days
+                status_detail = f"{days_until}d" if days_until > 0 else "today"
+            else:
+                guest_status = "past"
+                days_since = (today - check_out_date).days
+                status_detail = f"{days_since}d ago" if days_since > 0 else "today"
+
             conversations.append({
                 "reservation_id": r.id,
                 "hosttools_id": r.hosttools_id,
@@ -517,6 +532,8 @@ async def get_conversations(include_empty: bool = False):
                 "check_in": r.check_in.isoformat(),
                 "check_out": r.check_out.isoformat(),
                 "num_guests": r.num_guests,
+                "guest_status": guest_status,
+                "status_detail": status_detail,
                 "last_message_time": last_msg.timestamp.isoformat() if last_msg else None,
                 "last_message_preview": last_msg.body[:100] if last_msg else None,
                 "last_message_sender": last_msg.sender if last_msg else None,
@@ -525,10 +542,13 @@ async def get_conversations(include_empty: bool = False):
                 "message_count": len(messages),
             })
 
-        # Sort: needs_attention first, then by most recent message
+        # Sort: needs_attention first, then by guest status (current > future > past),
+        # then by most recent message
+        status_order = {"current": 0, "future": 1, "past": 2}
         conversations.sort(
             key=lambda c: (
                 not c["needs_attention"],
+                status_order.get(c["guest_status"], 3),
                 -(datetime.fromisoformat(c["last_message_time"]).timestamp() if c["last_message_time"] else 0),
             )
         )
@@ -632,8 +652,17 @@ async def send_message(reservation_id: int, req: SendMessageRequest):
             ai_confidence=req.ai_confidence,
             was_edited=req.was_edited,
             original_ai_draft=req.original_ai_draft,
+            feedback_note=req.ai_category,  # used by learning module
         )
         session.add(message)
+        await session.flush()
+
+        # Auto-learn from this reply
+        try:
+            from app.services.learning import record_reply_outcome
+            await record_reply_outcome(session, message, reservation)
+        except Exception as e:
+            logger.error("Learning failed (non-fatal): %s", e)
 
     return {"sent": True, "message_id": message.id}
 
@@ -752,6 +781,91 @@ async def import_knowledge(req: ImportKnowledgeRequest):
     async with get_session() as session:
         count = await import_from_en_json(session, req.json_data, req.replace)
     return {"imported": count}
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Message Templates
+# ---------------------------------------------------------------------------
+
+class TemplateRequest(BaseModel):
+    name: str
+    trigger: str
+    body: str
+    hours_offset: int = 14
+    enabled: bool = False
+    house_code: Optional[str] = None
+
+
+@router.get("/templates")
+async def list_templates():
+    """List all message templates."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(MessageTemplate).order_by(MessageTemplate.trigger)
+        )
+        templates = result.scalars().all()
+        return [
+            {
+                "id": t.id,
+                "name": t.name,
+                "trigger": t.trigger,
+                "body": t.body,
+                "hours_offset": t.hours_offset,
+                "enabled": t.enabled,
+                "house_code": t.house_code,
+            }
+            for t in templates
+        ]
+
+
+@router.post("/templates")
+async def create_template(req: TemplateRequest):
+    """Create a new message template."""
+    async with get_session() as session:
+        template = MessageTemplate(
+            name=req.name,
+            trigger=req.trigger,
+            body=req.body,
+            hours_offset=req.hours_offset,
+            enabled=req.enabled,
+            house_code=req.house_code,
+        )
+        session.add(template)
+        await session.flush()
+        return {"id": template.id, "created": True}
+
+
+@router.put("/templates/{template_id}")
+async def update_template(template_id: int, req: TemplateRequest):
+    """Update a message template."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(MessageTemplate).where(MessageTemplate.id == template_id)
+        )
+        template = result.scalar_one_or_none()
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+        template.name = req.name
+        template.trigger = req.trigger
+        template.body = req.body
+        template.hours_offset = req.hours_offset
+        template.enabled = req.enabled
+        template.house_code = req.house_code
+        return {"id": template.id, "updated": True}
+
+
+@router.delete("/templates/{template_id}")
+async def delete_template(template_id: int):
+    """Delete a message template."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(MessageTemplate).where(MessageTemplate.id == template_id)
+        )
+        template = result.scalar_one_or_none()
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+        await session.delete(template)
+        return {"id": template_id, "deleted": True}
 
 
 # ---------------------------------------------------------------------------
