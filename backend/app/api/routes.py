@@ -346,7 +346,56 @@ async def sync_reservations(full_history: bool = False):
 
                 total_synced += 1
 
-    return {"synced": total_synced, "messages_imported": total_messages}
+    # Run template detection on all host messages
+    from app.services.template_detector import detect_and_tag_templates
+
+    templates_tagged = 0
+    async with get_session() as tag_session:
+        templates_tagged = await detect_and_tag_templates(tag_session)
+
+    return {
+        "synced": total_synced,
+        "messages_imported": total_messages,
+        "templates_tagged": templates_tagged,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+@router.get("/stats")
+async def get_stats():
+    """Get data stats for training overview."""
+    async with get_session() as session:
+        listings = (await session.execute(select(func.count(Listing.id)))).scalar()
+        reservations = (await session.execute(select(func.count(Reservation.id)))).scalar()
+        total_msgs = (await session.execute(select(func.count(Message.id)))).scalar()
+        guest_msgs = (await session.execute(
+            select(func.count(Message.id)).where(Message.sender == "guest")
+        )).scalar()
+        host_msgs = (await session.execute(
+            select(func.count(Message.id)).where(Message.sender == "host")
+        )).scalar()
+        templates = (await session.execute(
+            select(func.count(Message.id)).where(Message.is_template == True)
+        )).scalar()
+        real_replies = (await session.execute(
+            select(func.count(Message.id)).where(
+                and_(Message.sender == "host", Message.is_template == False)
+            )
+        )).scalar()
+
+        return {
+            "listings": listings,
+            "reservations": reservations,
+            "total_messages": total_msgs,
+            "guest_messages": guest_msgs,
+            "host_messages": host_msgs,
+            "template_messages": templates,
+            "real_host_replies": real_replies,
+            "training_data_size": real_replies,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +610,7 @@ async def webhook_message(payload: WebhookMessagePayload):
         )
         session.add(message)
 
-    # Send Pushover notification
+    # Send ntfy notification
     if _ntfy:
         from app.services.ntfy import is_emergency_message
 
