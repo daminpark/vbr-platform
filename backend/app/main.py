@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router as api_router, set_services
+from app.core.auth import AuthMiddleware
 from app.core.config import settings
 from app.db.database import init_db
 from app.services.ai_drafter import AIDrafter
@@ -91,6 +92,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Auth middleware (must be added before CORS so it runs after CORS in the chain)
+app.add_middleware(AuthMiddleware)
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -111,7 +115,7 @@ if STATIC_DIR.exists():
 # Dashboard
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    """Serve the owner app."""
+    """Serve the owner app (auth check happens in JS)."""
     index_path = TEMPLATES_DIR / "index.html"
     if index_path.exists():
         return FileResponse(index_path)

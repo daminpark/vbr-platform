@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, date, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
@@ -28,6 +28,60 @@ def set_services(hosttools, ntfy, ai_drafter=None):
     _hosttools = hosttools
     _ntfy = ntfy
     _ai_drafter = ai_drafter
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    pin: str
+
+
+@router.post("/auth/login")
+async def login(req: LoginRequest, response: Response):
+    """Authenticate with PIN and set session cookie."""
+    from app.core.auth import create_session_cookie, COOKIE_NAME, COOKIE_MAX_AGE
+    from app.core.config import settings
+
+    if req.pin == settings.owner_pin:
+        role = "owner"
+    elif req.pin == settings.cleaner_pin:
+        role = "cleaner"
+    else:
+        raise HTTPException(status_code=401, detail="Invalid PIN")
+
+    cookie_value = create_session_cookie(role)
+    response.set_cookie(
+        COOKIE_NAME,
+        cookie_value,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=True,
+    )
+    return {"role": role}
+
+
+@router.get("/auth/check")
+async def auth_check(request: Request):
+    """Check if current session is valid."""
+    from app.core.auth import verify_session_cookie, COOKIE_NAME
+
+    cookie = request.cookies.get(COOKIE_NAME)
+    if not cookie:
+        return {"authenticated": False}
+    role = verify_session_cookie(cookie)
+    return {"authenticated": bool(role), "role": role}
+
+
+@router.post("/auth/logout")
+async def logout(response: Response):
+    """Clear session cookie."""
+    from app.core.auth import COOKIE_NAME
+
+    response.delete_cookie(COOKIE_NAME)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

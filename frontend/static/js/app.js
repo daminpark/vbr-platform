@@ -3,7 +3,9 @@
 const API_BASE = '/api';
 
 const state = {
-    view: 'conversations',  // conversations | thread
+    authenticated: false,
+    role: null,
+    view: 'conversations',  // login | conversations | thread
     conversations: [],
     currentReservationId: null,
     currentThread: null,
@@ -23,6 +25,13 @@ async function api(path, opts = {}) {
         headers: { 'Content-Type': 'application/json', ...opts.headers },
         ...opts,
     });
+    if (resp.status === 401) {
+        state.authenticated = false;
+        state.role = null;
+        state.view = 'login';
+        render();
+        throw new Error('Not authenticated');
+    }
     if (!resp.ok) {
         const text = await resp.text();
         throw new Error(`${resp.status}: ${text}`);
@@ -82,10 +91,88 @@ function render() {
     const app = document.getElementById('app');
     app.textContent = '';
 
+    if (!state.authenticated) {
+        renderLogin();
+        return;
+    }
+
     if (isDesktop()) {
         renderDesktopLayout();
     } else {
         renderMobileLayout();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render: Login
+// ---------------------------------------------------------------------------
+
+function renderLogin() {
+    const app = document.getElementById('app');
+    app.style.flexDirection = 'column';
+    app.style.height = '100dvh';
+
+    const wrap = el('div', 'login-wrap');
+
+    const title = el('h1', 'login-title', 'VBR');
+    wrap.appendChild(title);
+
+    const subtitle = el('div', 'login-subtitle', 'Enter PIN to continue');
+    wrap.appendChild(subtitle);
+
+    const form = el('div', 'login-form');
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.inputMode = 'numeric';
+    input.pattern = '[0-9]*';
+    input.className = 'login-input';
+    input.placeholder = 'PIN';
+    input.maxLength = 10;
+    input.autocomplete = 'off';
+    form.appendChild(input);
+
+    const error = el('div', 'login-error');
+    form.appendChild(error);
+
+    const btn = el('button', 'btn login-btn', 'Unlock');
+    btn.addEventListener('click', () => doLogin(input, error));
+    form.appendChild(btn);
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doLogin(input, error);
+    });
+
+    wrap.appendChild(form);
+    app.appendChild(wrap);
+
+    requestAnimationFrame(() => input.focus());
+}
+
+async function doLogin(input, errorEl) {
+    const pin = input.value.trim();
+    if (!pin) return;
+
+    errorEl.textContent = '';
+    try {
+        const resp = await fetch(API_BASE + '/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin }),
+        });
+        if (!resp.ok) {
+            errorEl.textContent = 'Invalid PIN';
+            input.value = '';
+            input.focus();
+            return;
+        }
+        const data = await resp.json();
+        state.authenticated = true;
+        state.role = data.role;
+        state.view = 'conversations';
+        loadConversations();
+    } catch (e) {
+        errorEl.textContent = 'Connection error';
     }
 }
 
@@ -687,6 +774,20 @@ window.addEventListener('resize', () => {
 // Boot
 // ---------------------------------------------------------------------------
 
-document.addEventListener('DOMContentLoaded', () => {
-    loadConversations();
+document.addEventListener('DOMContentLoaded', async () => {
+    // Check existing session
+    try {
+        const resp = await fetch(API_BASE + '/auth/check');
+        const data = await resp.json();
+        if (data.authenticated) {
+            state.authenticated = true;
+            state.role = data.role;
+            loadConversations();
+            return;
+        }
+    } catch (e) {
+        // Server unreachable — show login
+    }
+    state.authenticated = false;
+    render();
 });
