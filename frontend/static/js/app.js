@@ -1,11 +1,11 @@
-/* VBR Platform — Owner App (Phase 1b: AI Draft Replies) */
+/* VBR Platform — Owner + Cleaner App (Phase 1b + Inventory) */
 
 const API_BASE = '/api';
 
 const state = {
     authenticated: false,
     role: null,
-    view: 'conversations',  // login | conversations | thread
+    view: 'conversations',  // login | conversations | thread | inventory
     conversations: [],
     currentReservationId: null,
     currentThread: null,
@@ -14,6 +14,21 @@ const state = {
     draftLoading: false,
     draftDismissed: false,
     editingDraft: null,      // tracks AI origin when editing
+    // Inventory state
+    invSubView: 'items',     // items | alerts | shopping | locations | bulk-import
+    invItems: [],
+    invLocations: [],
+    invReports: [],
+    invShoppingList: [],
+    invSearchQuery: '',
+    invSearchResults: null,
+    invSearchLoading: false,
+    invFilter: { house_code: null, category: null },
+    invEditingItem: null,
+    invBulkPreview: null,
+    invBulkLoading: false,
+    invNlLoading: false,
+    invReportedIds: new Set(),  // items recently reported by cleaner (UI feedback)
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +111,17 @@ function render() {
         return;
     }
 
+    if (state.view === 'inventory') {
+        app.style.flexDirection = 'column';
+        app.style.height = '100dvh';
+        if (state.role === 'cleaner') {
+            renderCleanerInventory(app);
+        } else {
+            renderOwnerInventory(app);
+        }
+        return;
+    }
+
     if (isDesktop()) {
         renderDesktopLayout();
     } else {
@@ -168,8 +194,13 @@ async function doLogin(input, errorEl) {
         const data = await resp.json();
         state.authenticated = true;
         state.role = data.role;
-        state.view = 'conversations';
-        loadConversations();
+        if (data.role === 'cleaner') {
+            state.view = 'inventory';
+            loadInventory();
+        } else {
+            state.view = 'conversations';
+            loadConversations();
+        }
     } catch (e) {
         errorEl.textContent = 'Connection error';
     }
@@ -573,12 +604,20 @@ function getMsgClass(msg) {
 function renderTabBar(active) {
     const bar = el('div', 'tab-bar');
 
-    const tabs = [
-        { id: 'messages', icon: '\uD83D\uDCAC', label: 'Messages' },
-        { id: 'calendar', icon: '\uD83D\uDCC5', label: 'Calendar' },
-        { id: 'reviews', icon: '\u2B50', label: 'Reviews' },
-        { id: 'settings', icon: '\u2699\uFE0F', label: 'Settings' },
-    ];
+    let tabs;
+    if (state.role === 'cleaner') {
+        tabs = [
+            { id: 'inventory', icon: '\uD83D\uDD0D', label: 'Find' },
+            { id: 'reports', icon: '\uD83D\uDCE2', label: 'Report' },
+        ];
+    } else {
+        tabs = [
+            { id: 'messages', icon: '\uD83D\uDCAC', label: 'Messages' },
+            { id: 'inventory', icon: '\uD83D\uDCE6', label: 'Inventory' },
+            { id: 'calendar', icon: '\uD83D\uDCC5', label: 'Calendar' },
+            { id: 'settings', icon: '\u2699\uFE0F', label: 'Settings' },
+        ];
+    }
 
     tabs.forEach(tab => {
         const item = el('button', 'tab-item' + (active === tab.id ? ' active' : ''));
@@ -587,7 +626,15 @@ function renderTabBar(active) {
         item.addEventListener('click', () => {
             if (tab.id === 'messages') {
                 state.view = 'conversations';
-                render();
+                state.currentThread = null;
+                loadConversations();
+            } else if (tab.id === 'inventory') {
+                state.view = 'inventory';
+                loadInventory();
+            } else if (tab.id === 'reports') {
+                state.view = 'inventory';
+                state.invSubView = 'alerts';
+                loadInventory();
             }
         });
         bar.appendChild(item);
@@ -769,6 +816,679 @@ function el(tag, className, textContent) {
 }
 
 // ---------------------------------------------------------------------------
+// Inventory: Data Loading
+// ---------------------------------------------------------------------------
+
+async function loadInventory() {
+    try {
+        const [items, locations] = await Promise.all([
+            api('/inventory/items'),
+            api('/inventory/locations'),
+        ]);
+        state.invItems = items;
+        state.invLocations = locations;
+    } catch (e) {
+        console.error('Failed to load inventory:', e);
+        state.invItems = [];
+        state.invLocations = [];
+    }
+    render();
+}
+
+async function loadReports() {
+    try {
+        state.invReports = await api('/inventory/reports?resolved=false');
+    } catch (e) {
+        console.error('Failed to load reports:', e);
+        state.invReports = [];
+    }
+}
+
+async function loadShoppingList() {
+    try {
+        state.invShoppingList = await api('/inventory/shopping-list');
+    } catch (e) {
+        console.error('Failed to load shopping list:', e);
+        state.invShoppingList = [];
+    }
+}
+
+function addSelectOption(selectEl, value, label) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    selectEl.appendChild(opt);
+}
+
+// ---------------------------------------------------------------------------
+// Inventory: Owner View
+// ---------------------------------------------------------------------------
+
+function renderOwnerInventory(app) {
+    // Header
+    const header = el('div', 'header');
+    header.appendChild(el('h1', '', 'Inventory'));
+    const actions = el('div', 'header-actions');
+
+    const seedBtn = el('button', 'btn btn-ghost btn-sm', '+ Seed Locations');
+    seedBtn.addEventListener('click', async () => {
+        try {
+            const result = await api('/inventory/locations/seed', { method: 'POST' });
+            if (result.seeded) {
+                alert('Seeded ' + result.count + ' locations');
+                loadInventory();
+            } else {
+                alert(result.message);
+            }
+        } catch (e) {
+            alert('Seed failed: ' + e.message);
+        }
+    });
+    if (state.invLocations.length === 0) actions.appendChild(seedBtn);
+
+    header.appendChild(actions);
+    app.appendChild(header);
+
+    // Sub-nav pills
+    const subNav = el('div', 'inv-subnav');
+    const subViews = [
+        { id: 'items', label: 'All Items' },
+        { id: 'alerts', label: 'Alerts' },
+        { id: 'shopping', label: 'Shopping' },
+        { id: 'locations', label: 'Locations' },
+        { id: 'bulk-import', label: 'Import' },
+    ];
+    subViews.forEach(sv => {
+        const pill = el('button', 'inv-pill' + (state.invSubView === sv.id ? ' active' : ''), sv.label);
+        pill.addEventListener('click', async () => {
+            state.invSubView = sv.id;
+            if (sv.id === 'alerts') await loadReports();
+            if (sv.id === 'shopping') await loadShoppingList();
+            render();
+        });
+        subNav.appendChild(pill);
+    });
+    app.appendChild(subNav);
+
+    // Content area
+    const content = el('div', 'inv-content');
+
+    if (state.invSubView === 'items') {
+        renderOwnerItemsList(content);
+    } else if (state.invSubView === 'alerts') {
+        renderOwnerAlerts(content);
+    } else if (state.invSubView === 'shopping') {
+        renderOwnerShopping(content);
+    } else if (state.invSubView === 'locations') {
+        renderOwnerLocations(content);
+    } else if (state.invSubView === 'bulk-import') {
+        renderBulkImport(content);
+    }
+
+    app.appendChild(content);
+    app.appendChild(renderTabBar('inventory'));
+}
+
+function renderOwnerItemsList(container) {
+    // AI Input bar
+    const inputBar = el('div', 'inv-ai-bar');
+    const nlInput = document.createElement('input');
+    nlInput.type = 'text';
+    nlInput.className = 'inv-search-input';
+    nlInput.placeholder = 'Add naturally... "3 sponges in 195 kitchen"';
+    nlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') aiParseAndAdd(nlInput);
+    });
+    inputBar.appendChild(nlInput);
+    const addBtn = el('button', 'compose-send', '+');
+    addBtn.addEventListener('click', () => aiParseAndAdd(nlInput));
+    inputBar.appendChild(addBtn);
+    container.appendChild(inputBar);
+
+    if (state.invNlLoading) {
+        const ld = el('div', 'loading');
+        ld.appendChild(el('div', 'spinner'));
+        ld.appendChild(el('span', '', 'Parsing...'));
+        container.appendChild(ld);
+    }
+
+    // Filter row
+    const filterRow = el('div', 'inv-filters');
+    const houseSelect = document.createElement('select');
+    houseSelect.className = 'inv-select';
+    addSelectOption(houseSelect, '', 'All Houses');
+    addSelectOption(houseSelect, '193', '193');
+    addSelectOption(houseSelect, '195', '195');
+    houseSelect.value = state.invFilter.house_code || '';
+    houseSelect.addEventListener('change', () => {
+        state.invFilter.house_code = houseSelect.value || null;
+        render();
+    });
+    filterRow.appendChild(houseSelect);
+
+    const catSelect = document.createElement('select');
+    catSelect.className = 'inv-select';
+    addSelectOption(catSelect, '', 'All Categories');
+    const cats = [...new Set(state.invItems.map(i => i.category))].sort();
+    cats.forEach(c => addSelectOption(catSelect, c, c));
+    catSelect.value = state.invFilter.category || '';
+    catSelect.addEventListener('change', () => {
+        state.invFilter.category = catSelect.value || null;
+        render();
+    });
+    filterRow.appendChild(catSelect);
+
+    const countEl = el('span', 'inv-count');
+    filterRow.appendChild(countEl);
+    container.appendChild(filterRow);
+
+    // Filtered items
+    let items = state.invItems;
+    if (state.invFilter.house_code) {
+        items = items.filter(i => i.house_code === state.invFilter.house_code);
+    }
+    if (state.invFilter.category) {
+        items = items.filter(i => i.category === state.invFilter.category);
+    }
+    countEl.textContent = items.length + ' item' + (items.length !== 1 ? 's' : '');
+
+    if (items.length === 0) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', 'empty-state-icon', '\uD83D\uDCE6'));
+        empty.appendChild(el('div', '', 'No items yet'));
+        empty.appendChild(el('div', 'inv-hint', 'Use Import tab or the input bar above to add items'));
+        container.appendChild(empty);
+        return;
+    }
+
+    const list = el('div', 'inv-list');
+    items.forEach(item => {
+        const row = el('div', 'inv-item');
+
+        const info = el('div', 'inv-item-info');
+        const nameRow = el('div', 'inv-item-top');
+        nameRow.appendChild(el('span', 'inv-item-name', item.name));
+        if (item.quantity > 1) {
+            nameRow.appendChild(el('span', 'inv-item-qty', 'x' + item.quantity + (item.unit ? ' ' + item.unit : '')));
+        }
+        info.appendChild(nameRow);
+
+        const meta = el('div', 'conv-meta');
+        if (item.location_name) {
+            const locLabel = (item.house_code || '') + ' ' + item.location_name;
+            meta.appendChild(el('span', 'conv-badge badge-listing', locLabel.trim()));
+        }
+        meta.appendChild(el('span', 'conv-badge badge-platform', item.category));
+        if (item.has_alert) {
+            meta.appendChild(el('span', 'conv-badge badge-attention', item.alert_count + ' alert' + (item.alert_count > 1 ? 's' : '')));
+        }
+        if (item.brand) {
+            meta.appendChild(el('span', 'conv-badge badge-past', item.brand));
+        }
+        info.appendChild(meta);
+        row.appendChild(info);
+
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+function renderOwnerAlerts(container) {
+    if (state.invReports.length === 0) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', 'empty-state-icon', '\u2705'));
+        empty.appendChild(el('div', '', 'No unresolved alerts'));
+        container.appendChild(empty);
+        return;
+    }
+
+    const list = el('div', 'inv-list');
+    state.invReports.forEach(report => {
+        const row = el('div', 'inv-item');
+
+        const info = el('div', 'inv-item-info');
+        const nameRow = el('div', 'inv-item-top');
+        nameRow.appendChild(el('span', 'inv-item-name', report.item_name || 'Unknown'));
+        nameRow.appendChild(el('span', 'conv-time', relativeTime(report.created_at)));
+        info.appendChild(nameRow);
+
+        const meta = el('div', 'conv-meta');
+        const typeClass = report.report_type === 'missing' ? 'badge-attention' : 'badge-future';
+        meta.appendChild(el('span', 'conv-badge ' + typeClass, report.report_type.toUpperCase()));
+        if (report.location_name) {
+            meta.appendChild(el('span', 'conv-badge badge-listing', (report.house_code || '') + ' ' + report.location_name));
+        }
+        meta.appendChild(el('span', 'conv-badge badge-past', 'by ' + report.reported_by));
+        info.appendChild(meta);
+
+        if (report.notes) {
+            info.appendChild(el('div', 'conv-preview', report.notes));
+        }
+        row.appendChild(info);
+
+        const resolveBtn = el('button', 'btn btn-sm btn-ghost', '\u2713 Resolve');
+        resolveBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                await api('/inventory/reports/' + report.id + '/resolve', { method: 'PUT' });
+                await loadReports();
+                render();
+            } catch (err) {
+                alert('Failed: ' + err.message);
+            }
+        });
+        row.appendChild(resolveBtn);
+
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+function renderOwnerShopping(container) {
+    if (state.invShoppingList.length === 0) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', 'empty-state-icon', '\uD83D\uDED2'));
+        empty.appendChild(el('div', '', 'Shopping list is empty'));
+        container.appendChild(empty);
+        return;
+    }
+
+    const list = el('div', 'inv-list');
+    state.invShoppingList.forEach(entry => {
+        const row = el('div', 'inv-item');
+
+        const info = el('div', 'inv-item-info');
+        const nameRow = el('div', 'inv-item-top');
+        nameRow.appendChild(el('span', 'inv-item-name', entry.name));
+        info.appendChild(nameRow);
+
+        const meta = el('div', 'conv-meta');
+        const statusClass = entry.worst_status === 'missing' ? 'badge-attention' : 'badge-future';
+        meta.appendChild(el('span', 'conv-badge ' + statusClass, entry.worst_status));
+        if (entry.house_code) {
+            meta.appendChild(el('span', 'conv-badge badge-listing', entry.house_code + ' ' + (entry.location_name || '')));
+        }
+        if (entry.brand) {
+            meta.appendChild(el('span', 'conv-badge badge-past', entry.brand));
+        }
+        info.appendChild(meta);
+        row.appendChild(info);
+
+        if (entry.purchase_url) {
+            const buyBtn = el('button', 'btn btn-sm btn-primary', 'Buy');
+            buyBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                window.open(entry.purchase_url, '_blank');
+            });
+            row.appendChild(buyBtn);
+        }
+
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+function renderOwnerLocations(container) {
+    if (state.invLocations.length === 0) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', 'empty-state-icon', '\uD83D\uDDC2\uFE0F'));
+        empty.appendChild(el('div', '', 'No locations. Seed them first.'));
+        container.appendChild(empty);
+        return;
+    }
+
+    const list = el('div', 'inv-list');
+    state.invLocations.forEach(loc => {
+        const row = el('div', 'inv-item');
+        const info = el('div', 'inv-item-info');
+        const nameRow = el('div', 'inv-item-top');
+        nameRow.appendChild(el('span', 'inv-item-name', loc.house_code + ' ' + loc.name));
+        nameRow.appendChild(el('span', 'inv-item-qty', loc.item_count + ' items'));
+        info.appendChild(nameRow);
+
+        const meta = el('div', 'conv-meta');
+        if (loc.outdoor) meta.appendChild(el('span', 'conv-badge badge-future', 'outdoor'));
+        if (loc.locked) meta.appendChild(el('span', 'conv-badge badge-attention', 'locked'));
+        if (loc.guest_accessible) meta.appendChild(el('span', 'conv-badge badge-current', 'guest-accessible'));
+        info.appendChild(meta);
+
+        if (loc.description) {
+            info.appendChild(el('div', 'conv-preview', loc.description));
+        }
+
+        row.appendChild(info);
+
+        // Children
+        if (loc.children && loc.children.length > 0) {
+            const childList = el('div', 'inv-children');
+            loc.children.forEach(child => {
+                const childRow = el('div', 'inv-child');
+                childRow.appendChild(el('span', '', '\u2514 ' + child.name));
+                childRow.appendChild(el('span', 'inv-item-qty', child.item_count + ' items'));
+                childList.appendChild(childRow);
+            });
+            row.appendChild(childList);
+        }
+
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+function renderBulkImport(container) {
+    const wrap = el('div', 'inv-bulk-wrap');
+
+    if (!state.invBulkPreview) {
+        wrap.appendChild(el('div', 'inv-bulk-hint', 'Paste your inventory list below. Format: location, then items. AI will parse it.'));
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'inv-bulk-textarea';
+        textarea.placeholder = '193 toolshed: wd40, electrical tape, spare bulbs\n195 under kitchen sink: fairy, bleach, drain unblocker\ncleaning room: 3x bottles of bleach, sponges';
+        textarea.rows = 10;
+        wrap.appendChild(textarea);
+
+        const btnRow = el('div', 'inv-bulk-actions');
+        const parseBtn = el('button', 'btn btn-primary', state.invBulkLoading ? 'Parsing...' : 'Parse with AI');
+        if (state.invBulkLoading) parseBtn.disabled = true;
+        parseBtn.addEventListener('click', async () => {
+            const text = textarea.value.trim();
+            if (!text) return;
+            state.invBulkLoading = true;
+            render();
+            try {
+                state.invBulkPreview = await api('/inventory/ai/bulk-import', {
+                    method: 'POST',
+                    body: JSON.stringify({ text }),
+                });
+            } catch (e) {
+                alert('Parse failed: ' + e.message);
+            }
+            state.invBulkLoading = false;
+            render();
+        });
+        btnRow.appendChild(parseBtn);
+        wrap.appendChild(btnRow);
+    } else {
+        // Preview parsed items
+        const items = state.invBulkPreview.items || [];
+        wrap.appendChild(el('div', 'inv-bulk-hint', items.length + ' items parsed. Review and confirm:'));
+
+        const previewList = el('div', 'inv-list');
+        items.forEach((item, i) => {
+            const row = el('div', 'inv-item');
+            const info = el('div', 'inv-item-info');
+            const nameRow = el('div', 'inv-item-top');
+            nameRow.appendChild(el('span', 'inv-item-name', item.name));
+            if (item.quantity > 1) {
+                nameRow.appendChild(el('span', 'inv-item-qty', 'x' + item.quantity + (item.unit ? ' ' + item.unit : '')));
+            }
+            info.appendChild(nameRow);
+
+            const meta = el('div', 'conv-meta');
+            if (item.location_code || item.location_name) {
+                meta.appendChild(el('span', 'conv-badge badge-listing', item.location_code || item.location_name));
+            }
+            meta.appendChild(el('span', 'conv-badge badge-platform', item.category));
+            info.appendChild(meta);
+            row.appendChild(info);
+
+            const removeBtn = el('button', 'btn btn-sm btn-ghost', '\u2715');
+            removeBtn.style.color = 'var(--red)';
+            removeBtn.addEventListener('click', () => {
+                items.splice(i, 1);
+                render();
+            });
+            row.appendChild(removeBtn);
+
+            previewList.appendChild(row);
+        });
+        wrap.appendChild(previewList);
+
+        const btnRow = el('div', 'inv-bulk-actions');
+        const confirmBtn = el('button', 'btn btn-primary', 'Import ' + items.length + ' Items');
+        confirmBtn.addEventListener('click', async () => {
+            try {
+                await api('/inventory/ai/bulk-import/confirm', {
+                    method: 'POST',
+                    body: JSON.stringify({ items }),
+                });
+                state.invBulkPreview = null;
+                state.invSubView = 'items';
+                loadInventory();
+            } catch (e) {
+                alert('Import failed: ' + e.message);
+            }
+        });
+        const cancelBtn = el('button', 'btn btn-ghost', 'Cancel');
+        cancelBtn.addEventListener('click', () => {
+            state.invBulkPreview = null;
+            render();
+        });
+        btnRow.appendChild(confirmBtn);
+        btnRow.appendChild(cancelBtn);
+        wrap.appendChild(btnRow);
+    }
+
+    container.appendChild(wrap);
+}
+
+async function aiParseAndAdd(inputEl) {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = '';
+
+    state.invNlLoading = true;
+    render();
+
+    try {
+        const parsed = await api('/inventory/ai/parse', {
+            method: 'POST',
+            body: JSON.stringify({ text }),
+        });
+        const items = parsed.items || [];
+        if (items.length === 0) {
+            alert('Could not parse input. Try being more specific.');
+            state.invNlLoading = false;
+            render();
+            return;
+        }
+        // Auto-confirm: add all parsed items
+        await api('/inventory/ai/bulk-import/confirm', {
+            method: 'POST',
+            body: JSON.stringify({ items }),
+        });
+        state.invNlLoading = false;
+        loadInventory();
+    } catch (e) {
+        alert('Failed: ' + e.message);
+        state.invNlLoading = false;
+        render();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory: Cleaner View
+// ---------------------------------------------------------------------------
+
+function renderCleanerInventory(app) {
+    // Header
+    const header = el('div', 'header');
+    header.appendChild(el('h1', '', 'Find Stuff'));
+    app.appendChild(header);
+
+    // Search bar
+    const searchBar = el('div', 'inv-search-bar');
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.className = 'inv-search-input inv-search-lg';
+    searchInput.placeholder = 'Search... e.g. "drain stuff", "loo roll"';
+    searchInput.value = state.invSearchQuery;
+
+    let searchTimeout;
+    searchInput.addEventListener('input', () => {
+        state.invSearchQuery = searchInput.value;
+        clearTimeout(searchTimeout);
+        if (searchInput.value.trim().length >= 2) {
+            searchTimeout = setTimeout(() => doInventorySearch(searchInput.value.trim()), 300);
+        } else {
+            state.invSearchResults = null;
+            render();
+        }
+    });
+    searchBar.appendChild(searchInput);
+    app.appendChild(searchBar);
+
+    // Content
+    const content = el('div', 'inv-content');
+
+    if (state.invSearchLoading) {
+        const ld = el('div', 'loading');
+        ld.appendChild(el('div', 'spinner'));
+        ld.appendChild(el('span', '', 'Searching...'));
+        content.appendChild(ld);
+    } else if (state.invSearchResults !== null) {
+        // Search results
+        if (state.invSearchResults.length === 0) {
+            const empty = el('div', 'empty-state');
+            empty.appendChild(el('div', '', 'No results for "' + state.invSearchQuery + '"'));
+            content.appendChild(empty);
+        } else {
+            renderCleanerItemList(content, state.invSearchResults);
+        }
+    } else {
+        // Browse by location
+        renderCleanerLocationBrowse(content);
+    }
+
+    app.appendChild(content);
+    app.appendChild(renderTabBar('inventory'));
+
+    // Focus search on render
+    requestAnimationFrame(() => searchInput.focus());
+}
+
+function renderCleanerItemList(container, items) {
+    const list = el('div', 'inv-list');
+    items.forEach(item => {
+        const row = el('div', 'inv-item');
+
+        const info = el('div', 'inv-item-info');
+        const nameRow = el('div', 'inv-item-top');
+        nameRow.appendChild(el('span', 'inv-item-name', item.name));
+        if (item.quantity > 1) {
+            nameRow.appendChild(el('span', 'inv-item-qty', 'x' + item.quantity));
+        }
+        info.appendChild(nameRow);
+
+        const meta = el('div', 'conv-meta');
+        if (item.location_name) {
+            const locLabel = (item.house_code || '') + ' ' + item.location_name;
+            meta.appendChild(el('span', 'conv-badge badge-listing', locLabel.trim()));
+        }
+        info.appendChild(meta);
+        row.appendChild(info);
+
+        // Action buttons
+        const actionsDiv = el('div', 'inv-actions');
+        const reported = state.invReportedIds.has(item.id);
+
+        if (reported) {
+            const doneBtn = el('button', 'btn btn-sm btn-reported', '\u2713 Reported');
+            actionsDiv.appendChild(doneBtn);
+        } else {
+            const lowBtn = el('button', 'btn btn-sm btn-low', 'Low');
+            lowBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                reportStock(item.id, 'low');
+            });
+            actionsDiv.appendChild(lowBtn);
+
+            const missingBtn = el('button', 'btn btn-sm btn-missing', 'Out');
+            missingBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                reportStock(item.id, 'missing');
+            });
+            actionsDiv.appendChild(missingBtn);
+        }
+        row.appendChild(actionsDiv);
+
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+function renderCleanerLocationBrowse(container) {
+    if (state.invLocations.length === 0) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', '', 'No locations loaded'));
+        container.appendChild(empty);
+        return;
+    }
+
+    // Flatten locations with their items for browsing
+    const flatLocations = [];
+    state.invLocations.forEach(loc => {
+        flatLocations.push(loc);
+        if (loc.children) {
+            loc.children.forEach(child => flatLocations.push(child));
+        }
+    });
+
+    container.appendChild(el('div', 'inv-browse-hint', 'Browse by location'));
+    const list = el('div', 'inv-list');
+    flatLocations.forEach(loc => {
+        const row = el('div', 'inv-item inv-loc-row');
+        row.addEventListener('click', async () => {
+            // Search by location name to show its items
+            state.invSearchQuery = '';
+            try {
+                state.invSearchResults = await api('/inventory/items?location_id=' + loc.id);
+            } catch (e) {
+                state.invSearchResults = [];
+            }
+            render();
+        });
+        const info = el('div', 'inv-item-info');
+        info.appendChild(el('span', 'inv-item-name', loc.house_code + ' ' + loc.name));
+        info.appendChild(el('span', 'inv-item-qty', loc.item_count + ' items'));
+        row.appendChild(info);
+        row.appendChild(el('span', 'inv-chevron', '\u203A'));
+        list.appendChild(row);
+    });
+    container.appendChild(list);
+}
+
+async function doInventorySearch(query) {
+    state.invSearchLoading = true;
+    render();
+
+    try {
+        state.invSearchResults = await api('/inventory/search', {
+            method: 'POST',
+            body: JSON.stringify({ query }),
+        });
+    } catch (e) {
+        console.error('Search failed:', e);
+        state.invSearchResults = [];
+    }
+    state.invSearchLoading = false;
+    render();
+}
+
+async function reportStock(itemId, reportType) {
+    try {
+        await api('/inventory/reports', {
+            method: 'POST',
+            body: JSON.stringify({ item_id: itemId, report_type: reportType }),
+        });
+        state.invReportedIds.add(itemId);
+        render();
+    } catch (e) {
+        alert('Failed to report: ' + e.message);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Responsive: re-render on resize
 // ---------------------------------------------------------------------------
 
@@ -790,7 +1510,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.authenticated) {
             state.authenticated = true;
             state.role = data.role;
-            loadConversations();
+            if (data.role === 'cleaner') {
+                state.view = 'inventory';
+                loadInventory();
+            } else {
+                loadConversations();
+            }
             return;
         }
     } catch (e) {

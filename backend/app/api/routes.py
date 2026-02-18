@@ -7,11 +7,14 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
 
 from app.db.database import get_session
-from app.db.models import Listing, Reservation, Message, KnowledgeEntry, MessageTemplate
+from app.db.models import (
+    Listing, Reservation, Message, KnowledgeEntry, MessageTemplate,
+    InventoryLocation, InventoryItem, StockReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +24,15 @@ router = APIRouter()
 _hosttools = None
 _ntfy = None
 _ai_drafter = None
+_inventory_ai = None
 
 
-def set_services(hosttools, ntfy, ai_drafter=None):
-    global _hosttools, _ntfy, _ai_drafter
+def set_services(hosttools, ntfy, ai_drafter=None, inventory_ai=None):
+    global _hosttools, _ntfy, _ai_drafter, _inventory_ai
     _hosttools = hosttools
     _ntfy = ntfy
     _ai_drafter = ai_drafter
+    _inventory_ai = inventory_ai
 
 
 # ---------------------------------------------------------------------------
@@ -959,4 +964,874 @@ async def health_check():
         "hosttools_configured": bool(_hosttools and _hosttools.auth_token),
         "ntfy_configured": bool(_ntfy and _ntfy.configured),
         "ai_configured": bool(_ai_drafter),
+        "inventory_ai_configured": bool(_inventory_ai),
     }
+
+
+# ---------------------------------------------------------------------------
+# Inventory — Locations
+# ---------------------------------------------------------------------------
+
+class LocationRequest(BaseModel):
+    house_code: str
+    name: str
+    code: Optional[str] = None
+    parent_id: Optional[int] = None
+    description: Optional[str] = None
+    guest_accessible: bool = False
+    locked: bool = False
+    outdoor: bool = False
+
+
+def _serialize_location(loc: InventoryLocation, include_children: bool = False) -> dict:
+    """Serialize a location to a dict."""
+    d = {
+        "id": loc.id,
+        "house_code": loc.house_code,
+        "name": loc.name,
+        "code": loc.code,
+        "parent_id": loc.parent_id,
+        "description": loc.description,
+        "guest_accessible": loc.guest_accessible,
+        "locked": loc.locked,
+        "outdoor": loc.outdoor,
+        "sort_order": loc.sort_order,
+        "item_count": len(loc.items) if loc.items else 0,
+    }
+    if include_children and loc.children:
+        d["children"] = [_serialize_location(c) for c in loc.children]
+    return d
+
+
+def _serialize_item(item: InventoryItem) -> dict:
+    """Serialize an inventory item to a dict."""
+    loc = item.location
+    unresolved = [r for r in (item.stock_reports or []) if not r.resolved]
+    return {
+        "id": item.id,
+        "name": item.name,
+        "category": item.category,
+        "location_id": item.location_id,
+        "location_name": loc.name if loc else None,
+        "location_code": loc.code if loc else None,
+        "house_code": loc.house_code if loc else None,
+        "quantity": item.quantity,
+        "unit": item.unit,
+        "min_quantity": item.min_quantity,
+        "brand": item.brand,
+        "purchase_url": item.purchase_url,
+        "status": item.status,
+        "notes": item.notes,
+        "product_description": item.product_description,
+        "usage_instructions": item.usage_instructions,
+        "suitable_for": item.suitable_for,
+        "has_alert": len(unresolved) > 0,
+        "alert_count": len(unresolved),
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+    }
+
+
+async def _get_locations_context(session) -> list[dict]:
+    """Get all locations formatted for AI context injection."""
+    result = await session.execute(
+        select(InventoryLocation)
+        .options(selectinload(InventoryLocation.parent))
+        .where(InventoryLocation.active == True)
+        .order_by(InventoryLocation.sort_order)
+    )
+    locations = result.scalars().all()
+    return [
+        {
+            "id": loc.id,
+            "code": loc.code,
+            "house_code": loc.house_code,
+            "name": loc.name,
+            "parent_name": loc.parent.name if loc.parent else None,
+            "description": loc.description,
+            "guest_accessible": loc.guest_accessible,
+            "locked": loc.locked,
+            "outdoor": loc.outdoor,
+        }
+        for loc in locations
+    ]
+
+
+@router.get("/inventory/locations")
+async def get_inventory_locations(house_code: Optional[str] = None):
+    """Get all storage locations, optionally filtered by house."""
+    async with get_session() as session:
+        query = (
+            select(InventoryLocation)
+            .options(
+                selectinload(InventoryLocation.children),
+                selectinload(InventoryLocation.items),
+            )
+            .where(InventoryLocation.active == True)
+        )
+        if house_code:
+            query = query.where(InventoryLocation.house_code == house_code)
+        query = query.where(InventoryLocation.parent_id == None)  # top-level only
+        query = query.order_by(InventoryLocation.sort_order, InventoryLocation.house_code, InventoryLocation.name)
+        result = await session.execute(query)
+        locations = result.scalars().unique().all()
+        return [_serialize_location(loc, include_children=True) for loc in locations]
+
+
+@router.post("/inventory/locations")
+async def create_inventory_location(req: LocationRequest, request: Request):
+    """Create a new storage location."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        loc = InventoryLocation(
+            house_code=req.house_code,
+            name=req.name,
+            code=req.code,
+            parent_id=req.parent_id,
+            description=req.description,
+            guest_accessible=req.guest_accessible,
+            locked=req.locked,
+            outdoor=req.outdoor,
+        )
+        session.add(loc)
+        await session.flush()
+        return {"id": loc.id, "created": True}
+
+
+@router.put("/inventory/locations/{location_id}")
+async def update_inventory_location(location_id: int, req: LocationRequest, request: Request):
+    """Update a storage location."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryLocation).where(InventoryLocation.id == location_id)
+        )
+        loc = result.scalar_one_or_none()
+        if not loc:
+            raise HTTPException(status_code=404, detail="Location not found")
+        loc.house_code = req.house_code
+        loc.name = req.name
+        loc.code = req.code
+        loc.parent_id = req.parent_id
+        loc.description = req.description
+        loc.guest_accessible = req.guest_accessible
+        loc.locked = req.locked
+        loc.outdoor = req.outdoor
+        return {"id": loc.id, "updated": True}
+
+
+@router.delete("/inventory/locations/{location_id}")
+async def delete_inventory_location(location_id: int, request: Request):
+    """Soft-delete a storage location."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryLocation).where(InventoryLocation.id == location_id)
+        )
+        loc = result.scalar_one_or_none()
+        if not loc:
+            raise HTTPException(status_code=404, detail="Location not found")
+        loc.active = False
+        return {"id": location_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Inventory — Seed Locations
+# ---------------------------------------------------------------------------
+
+@router.post("/inventory/locations/seed")
+async def seed_inventory_locations(request: Request):
+    """Seed initial storage locations from STORAGE_LOCATIONS.md data."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+
+    # Check if already seeded
+    async with get_session() as session:
+        count = (await session.execute(
+            select(func.count(InventoryLocation.id))
+        )).scalar()
+        if count > 0:
+            return {"seeded": False, "message": "Locations already exist", "count": count}
+
+    SEED_LOCATIONS = [
+        # Outside — 193
+        {"code": "193.W", "house_code": "193", "name": "Kitchen Yard", "outdoor": True,
+         "description": "Go outside from kitchen. Some rain cover to cupboard, none to shed."},
+        {"code": "193.W.C", "house_code": "193", "name": "Cupboard (Paint/Chemicals)", "outdoor": True,
+         "parent_code": "193.W",
+         "description": "Electricity meter inside. Very dusty. Under cover. Good for paints/chemicals."},
+        {"code": "193.W.S", "house_code": "193", "name": "Shed (Toolshed)", "outdoor": True, "locked": True,
+         "parent_code": "193.W",
+         "description": "Cramped, dark, exposed to rain getting to it. Main tool storage. Shelves on both sides."},
+        # Outside — 195
+        {"code": "195.W", "house_code": "195", "name": "Outside Storage Area", "outdoor": True,
+         "description": "External storage with Keter boxes and cupboard."},
+        {"code": "195.W.K1", "house_code": "195", "name": "Keter Box 1 (Sheets)", "outdoor": True,
+         "parent_code": "195.W",
+         "description": "Spare sheets/linen. Check for damp periodically."},
+        {"code": "195.W.K2", "house_code": "195", "name": "Keter Box 2 (Door Hardware)", "outdoor": True,
+         "parent_code": "195.W",
+         "description": "Door hardware — needs sorting and audit. Currently a jumble."},
+        {"code": "195.W.C", "house_code": "195", "name": "Cupboard (Large Appliances)", "outdoor": True,
+         "parent_code": "195.W",
+         "description": "Dehumidifier, pressure washer. Good for bulky seasonal items."},
+        # Patio — 193
+        {"code": "193.P", "house_code": "193", "name": "Patio (Ground Floor)", "outdoor": True,
+         "description": "Accessible through a guest room. Awkward access if guests are in."},
+        {"code": "193.P.K", "house_code": "193", "name": "Keter Box", "outdoor": True,
+         "parent_code": "193.P",
+         "description": "Overflow trade supplies. Plumbing bits, electrical parts."},
+        # Kitchen — both houses
+        {"code": "193.K", "house_code": "193", "name": "Kitchen", "guest_accessible": True,
+         "description": "Under sink + cabinets. Limited space. Kitchen supplies only."},
+        {"code": "195.K", "house_code": "195", "name": "Kitchen", "guest_accessible": True,
+         "description": "Under sink + cabinets. Limited space. Kitchen supplies only."},
+        # Dining Room — both houses
+        {"code": "193.0", "house_code": "193", "name": "Dining Room", "guest_accessible": True,
+         "description": "Whole wall of shelves. Guest-visible — must be tidy/boxed. Good for guest supplies, spare toiletries."},
+        {"code": "195.0", "house_code": "195", "name": "Dining Room", "guest_accessible": True,
+         "description": "Whole wall of shelves. Guest-visible — must be tidy/boxed. Good for guest supplies, spare toiletries."},
+        # Utility / Laundry — both houses
+        {"code": "193.Y", "house_code": "193", "name": "Utility / Laundry",
+         "description": "Washing machine + dryer. Linen and laundry related stuff only."},
+        {"code": "195.Y", "house_code": "195", "name": "Utility / Laundry",
+         "description": "Washing machine + dryer. Linen and laundry related stuff only."},
+        # Cleaning Storage — both houses
+        {"code": "193.Z", "house_code": "193", "name": "Cleaning Storage",
+         "description": "Primary cleaning supply location. Lower area: daily products. Step stool available."},
+        {"code": "193.Z.U", "house_code": "193", "name": "Upper Shelves", "parent_code": "193.Z",
+         "description": "Backup/bulk cleaning stock. Step stool hanging in room. Spare bottles, bulk packs."},
+        {"code": "195.Z", "house_code": "195", "name": "Cleaning Storage",
+         "description": "Primary cleaning supply location. Lower area: daily products. Step stool available."},
+        {"code": "195.Z.U", "house_code": "195", "name": "Upper Shelves", "parent_code": "195.Z",
+         "description": "Backup/bulk cleaning stock. Step stool hanging in room. Spare bottles, bulk packs."},
+        # Luggage / Basement — both houses
+        {"code": "193.V", "house_code": "193", "name": "Basement (Luggage Area)", "guest_accessible": True,
+         "description": "Primary: guest luggage. Less accessible corner: carpet/underlay (renovation materials)."},
+        {"code": "195.V", "house_code": "195", "name": "Basement (Luggage Area)", "guest_accessible": True,
+         "description": "Primary: guest luggage. Less accessible part: tiles, grout, cement, filler (renovation materials)."},
+        # Wardrobes — upper floors
+        {"code": "195.U", "house_code": "195", "name": "First Floor Wardrobe", "locked": True,
+         "description": "Personal stuff + two guest cots. Locked."},
+        {"code": "193.U", "house_code": "193", "name": "Wardrobe",
+         "description": "Some stuff for sale, two cots, spare TV. Largely empty — good overflow capacity."},
+    ]
+
+    async with get_session() as session:
+        # First pass: create all locations without parents
+        code_to_id = {}
+        for i, loc_data in enumerate(SEED_LOCATIONS):
+            loc = InventoryLocation(
+                code=loc_data["code"],
+                house_code=loc_data["house_code"],
+                name=loc_data["name"],
+                outdoor=loc_data.get("outdoor", False),
+                locked=loc_data.get("locked", False),
+                guest_accessible=loc_data.get("guest_accessible", False),
+                description=loc_data.get("description"),
+                sort_order=i,
+            )
+            session.add(loc)
+            await session.flush()
+            code_to_id[loc_data["code"]] = loc.id
+
+        # Second pass: set parent_ids
+        for loc_data in SEED_LOCATIONS:
+            parent_code = loc_data.get("parent_code")
+            if parent_code and parent_code in code_to_id:
+                result = await session.execute(
+                    select(InventoryLocation).where(InventoryLocation.code == loc_data["code"])
+                )
+                loc = result.scalar_one_or_none()
+                if loc:
+                    loc.parent_id = code_to_id[parent_code]
+
+    return {"seeded": True, "count": len(SEED_LOCATIONS)}
+
+
+# ---------------------------------------------------------------------------
+# Inventory — Items
+# ---------------------------------------------------------------------------
+
+class ItemRequest(BaseModel):
+    name: str
+    category: str
+    location_id: Optional[int] = None
+    quantity: int = 1
+    unit: Optional[str] = None
+    min_quantity: int = 0
+    brand: Optional[str] = None
+    purchase_url: Optional[str] = None
+    notes: Optional[str] = None
+    status: str = "in_use"
+    product_description: Optional[str] = None
+    usage_instructions: Optional[str] = None
+    suitable_for: Optional[str] = None
+
+
+@router.get("/inventory/items")
+async def get_inventory_items(
+    house_code: Optional[str] = None,
+    category: Optional[str] = None,
+    location_id: Optional[int] = None,
+    status: Optional[str] = None,
+    low_stock: bool = False,
+):
+    """Get inventory items with optional filters."""
+    async with get_session() as session:
+        query = (
+            select(InventoryItem)
+            .options(
+                selectinload(InventoryItem.location),
+                selectinload(InventoryItem.stock_reports),
+            )
+            .where(InventoryItem.active == True)
+        )
+        if house_code:
+            query = query.outerjoin(InventoryLocation).where(
+                InventoryLocation.house_code == house_code
+            )
+        if category:
+            query = query.where(InventoryItem.category == category)
+        if location_id:
+            query = query.where(InventoryItem.location_id == location_id)
+        if status:
+            query = query.where(InventoryItem.status == status)
+        if low_stock:
+            query = query.where(
+                and_(
+                    InventoryItem.min_quantity > 0,
+                    InventoryItem.quantity <= InventoryItem.min_quantity,
+                )
+            )
+        query = query.order_by(InventoryItem.name)
+        result = await session.execute(query)
+        items = result.scalars().unique().all()
+        return [_serialize_item(item) for item in items]
+
+
+@router.get("/inventory/items/{item_id}")
+async def get_inventory_item(item_id: int):
+    """Get a single inventory item."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryItem)
+            .options(
+                selectinload(InventoryItem.location),
+                selectinload(InventoryItem.stock_reports),
+            )
+            .where(InventoryItem.id == item_id)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return _serialize_item(item)
+
+
+@router.post("/inventory/items")
+async def create_inventory_item(req: ItemRequest, request: Request):
+    """Create a new inventory item. Also generates AI search aliases."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        item = InventoryItem(
+            name=req.name,
+            category=req.category,
+            location_id=req.location_id,
+            quantity=req.quantity,
+            unit=req.unit,
+            min_quantity=req.min_quantity,
+            brand=req.brand,
+            purchase_url=req.purchase_url,
+            notes=req.notes,
+            status=req.status,
+            product_description=req.product_description,
+            usage_instructions=req.usage_instructions,
+            suitable_for=req.suitable_for,
+        )
+        session.add(item)
+        await session.flush()
+        item_id = item.id
+
+    # Generate search aliases in background (non-blocking)
+    if _inventory_ai:
+        try:
+            aliases = await _inventory_ai.generate_search_aliases(req.name, req.category)
+            if aliases:
+                async with get_session() as session:
+                    result = await session.execute(
+                        select(InventoryItem).where(InventoryItem.id == item_id)
+                    )
+                    item = result.scalar_one_or_none()
+                    if item:
+                        item.search_aliases = ", ".join(aliases)
+        except Exception as e:
+            logger.error("Alias generation failed (non-fatal): %s", e)
+
+    return {"id": item_id, "created": True}
+
+
+@router.put("/inventory/items/{item_id}")
+async def update_inventory_item(item_id: int, req: ItemRequest, request: Request):
+    """Update an inventory item."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryItem).where(InventoryItem.id == item_id)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        old_name = item.name
+        item.name = req.name
+        item.category = req.category
+        item.location_id = req.location_id
+        item.quantity = req.quantity
+        item.unit = req.unit
+        item.min_quantity = req.min_quantity
+        item.brand = req.brand
+        item.purchase_url = req.purchase_url
+        item.notes = req.notes
+        item.status = req.status
+        item.product_description = req.product_description
+        item.usage_instructions = req.usage_instructions
+        item.suitable_for = req.suitable_for
+
+    # Regenerate aliases if name changed
+    if _inventory_ai and req.name != old_name:
+        try:
+            aliases = await _inventory_ai.generate_search_aliases(req.name, req.category)
+            if aliases:
+                async with get_session() as session:
+                    result = await session.execute(
+                        select(InventoryItem).where(InventoryItem.id == item_id)
+                    )
+                    item = result.scalar_one_or_none()
+                    if item:
+                        item.search_aliases = ", ".join(aliases)
+        except Exception as e:
+            logger.error("Alias regeneration failed (non-fatal): %s", e)
+
+    return {"id": item_id, "updated": True}
+
+
+class MoveItemRequest(BaseModel):
+    location_id: int
+
+
+@router.put("/inventory/items/{item_id}/move")
+async def move_inventory_item(item_id: int, req: MoveItemRequest, request: Request):
+    """Move an item to a new location."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryItem).where(InventoryItem.id == item_id)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        item.location_id = req.location_id
+        return {"id": item_id, "moved": True, "location_id": req.location_id}
+
+
+@router.delete("/inventory/items/{item_id}")
+async def delete_inventory_item(item_id: int, request: Request):
+    """Soft-delete an inventory item."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(InventoryItem).where(InventoryItem.id == item_id)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        item.active = False
+        return {"id": item_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Inventory — AI-powered Search
+# ---------------------------------------------------------------------------
+
+class InventorySearchRequest(BaseModel):
+    query: str
+    house_code: Optional[str] = None
+
+
+@router.post("/inventory/search")
+async def search_inventory(req: InventorySearchRequest):
+    """Fuzzy search inventory items. Tier 1: DB LIKE search. Tier 2: AI fallback."""
+    query_lower = req.query.lower().strip()
+    if not query_lower:
+        return []
+
+    async with get_session() as session:
+        # Tier 1: DB search against name and search_aliases
+        filters = [InventoryItem.active == True]
+        name_filter = or_(
+            func.lower(InventoryItem.name).contains(query_lower),
+            func.lower(InventoryItem.search_aliases).contains(query_lower),
+        )
+
+        query = (
+            select(InventoryItem)
+            .options(
+                selectinload(InventoryItem.location),
+                selectinload(InventoryItem.stock_reports),
+            )
+            .where(and_(*filters, name_filter))
+        )
+        if req.house_code:
+            query = query.outerjoin(InventoryLocation).where(
+                InventoryLocation.house_code == req.house_code
+            )
+        query = query.order_by(InventoryItem.name)
+        result = await session.execute(query)
+        items = result.scalars().unique().all()
+
+        if items:
+            return [_serialize_item(item) for item in items]
+
+        # Tier 2: AI fallback if no DB matches
+        if _inventory_ai:
+            all_result = await session.execute(
+                select(InventoryItem)
+                .options(selectinload(InventoryItem.location))
+                .where(InventoryItem.active == True)
+            )
+            all_items = all_result.scalars().unique().all()
+            if not all_items:
+                return []
+
+            items_summary = [
+                {
+                    "id": i.id,
+                    "name": i.name,
+                    "category": i.category,
+                    "location_name": i.location.name if i.location else "unknown",
+                }
+                for i in all_items
+            ]
+            matches = await _inventory_ai.fuzzy_search(req.query, items_summary)
+
+            # Fetch full item data for matches
+            matched_ids = [m.get("item_id") for m in matches if m.get("item_id")]
+            if matched_ids:
+                matched_result = await session.execute(
+                    select(InventoryItem)
+                    .options(
+                        selectinload(InventoryItem.location),
+                        selectinload(InventoryItem.stock_reports),
+                    )
+                    .where(InventoryItem.id.in_(matched_ids))
+                )
+                matched_items = {i.id: i for i in matched_result.scalars().unique().all()}
+                return [
+                    {**_serialize_item(matched_items[m["item_id"]]), "ai_match": True, "match_reason": m.get("reason", "")}
+                    for m in matches
+                    if m.get("item_id") in matched_items
+                ]
+
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Inventory — AI Parse & Suggest
+# ---------------------------------------------------------------------------
+
+class NLInputRequest(BaseModel):
+    text: str
+
+
+@router.post("/inventory/ai/parse")
+async def ai_parse_inventory_input(req: NLInputRequest, request: Request):
+    """Parse natural language input into structured inventory items."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    if not _inventory_ai:
+        raise HTTPException(status_code=503, detail="Inventory AI not configured")
+
+    async with get_session() as session:
+        locations = await _get_locations_context(session)
+
+    result = await _inventory_ai.parse_natural_language_input(req.text, locations)
+    return result
+
+
+class BulkImportRequest(BaseModel):
+    text: str
+
+
+@router.post("/inventory/ai/bulk-import")
+async def ai_bulk_import_preview(req: BulkImportRequest, request: Request):
+    """Parse a text dump into structured items (preview — does not save)."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    if not _inventory_ai:
+        raise HTTPException(status_code=503, detail="Inventory AI not configured")
+
+    async with get_session() as session:
+        locations = await _get_locations_context(session)
+
+    result = await _inventory_ai.parse_bulk_import(req.text, locations)
+    return result
+
+
+class BulkImportConfirmItem(BaseModel):
+    name: str
+    category: str
+    location_code: Optional[str] = None
+    quantity: int = 1
+    unit: Optional[str] = None
+
+
+class BulkImportConfirmRequest(BaseModel):
+    items: list[BulkImportConfirmItem]
+
+
+@router.post("/inventory/ai/bulk-import/confirm")
+async def ai_bulk_import_confirm(req: BulkImportConfirmRequest, request: Request):
+    """Confirm and save bulk import items to database."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+
+    created = 0
+    async with get_session() as session:
+        # Build code-to-id map
+        loc_result = await session.execute(
+            select(InventoryLocation).where(InventoryLocation.active == True)
+        )
+        code_to_id = {
+            loc.code: loc.id for loc in loc_result.scalars().all() if loc.code
+        }
+
+        for item_data in req.items:
+            location_id = code_to_id.get(item_data.location_code)
+            item = InventoryItem(
+                name=item_data.name,
+                category=item_data.category,
+                location_id=location_id,
+                quantity=item_data.quantity,
+                unit=item_data.unit,
+            )
+            session.add(item)
+            created += 1
+        await session.flush()
+
+    # Generate search aliases for all new items (fire-and-forget style)
+    if _inventory_ai:
+        for item_data in req.items:
+            try:
+                aliases = await _inventory_ai.generate_search_aliases(item_data.name, item_data.category)
+                if aliases:
+                    async with get_session() as session:
+                        result = await session.execute(
+                            select(InventoryItem).where(
+                                and_(
+                                    InventoryItem.name == item_data.name,
+                                    InventoryItem.active == True,
+                                )
+                            )
+                        )
+                        item = result.scalar_one_or_none()
+                        if item and not item.search_aliases:
+                            item.search_aliases = ", ".join(aliases)
+            except Exception as e:
+                logger.error("Alias generation failed for %s (non-fatal): %s", item_data.name, e)
+
+    return {"created": created}
+
+
+class SuggestLocationRequest(BaseModel):
+    item_name: str
+    category: str
+
+
+@router.post("/inventory/ai/suggest-location")
+async def ai_suggest_location(req: SuggestLocationRequest, request: Request):
+    """Get AI suggestions for where to store an item."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    if not _inventory_ai:
+        raise HTTPException(status_code=503, detail="Inventory AI not configured")
+
+    async with get_session() as session:
+        locations = await _get_locations_context(session)
+
+    suggestions = await _inventory_ai.suggest_location(req.item_name, req.category, locations)
+
+    # Enrich suggestions with location IDs
+    async with get_session() as session:
+        loc_result = await session.execute(
+            select(InventoryLocation).where(InventoryLocation.active == True)
+        )
+        code_to_loc = {
+            loc.code: {"id": loc.id, "name": loc.name, "house_code": loc.house_code}
+            for loc in loc_result.scalars().all() if loc.code
+        }
+        for s in suggestions:
+            loc_info = code_to_loc.get(s.get("location_code"))
+            if loc_info:
+                s["location_id"] = loc_info["id"]
+                s["house_code"] = loc_info["house_code"]
+
+    return {"suggestions": suggestions}
+
+
+# ---------------------------------------------------------------------------
+# Inventory — Stock Reports
+# ---------------------------------------------------------------------------
+
+class StockReportRequest(BaseModel):
+    item_id: int
+    report_type: str  # "low" or "missing"
+    notes: Optional[str] = None
+
+
+@router.post("/inventory/reports")
+async def create_stock_report(req: StockReportRequest, request: Request):
+    """Create a stock report (any role can report)."""
+    role = getattr(request.state, "role", "cleaner")
+
+    async with get_session() as session:
+        # Verify item exists
+        item_result = await session.execute(
+            select(InventoryItem)
+            .options(selectinload(InventoryItem.location))
+            .where(InventoryItem.id == req.item_id)
+        )
+        item = item_result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        report = StockReport(
+            item_id=req.item_id,
+            report_type=req.report_type,
+            reported_by=role,
+            notes=req.notes,
+        )
+        session.add(report)
+        await session.flush()
+        report_id = report.id
+
+        # Get info for notification
+        item_name = item.name
+        location_name = item.location.name if item.location else ""
+
+    # Send ntfy notification to Pierre
+    if _ntfy and _ntfy.configured:
+        if req.report_type == "missing":
+            await _ntfy.send(
+                title="🚫 Out of Stock",
+                message=f"{item_name}" + (f" ({location_name})" if location_name else ""),
+                priority=4,
+                tags=["x"],
+            )
+        else:
+            await _ntfy.notify_running_low(item_name, location_name)
+
+    return {"id": report_id, "created": True}
+
+
+@router.get("/inventory/reports")
+async def get_stock_reports(
+    resolved: Optional[bool] = None,
+    request: Request = None,
+):
+    """Get stock reports. Default: unresolved only."""
+    async with get_session() as session:
+        query = (
+            select(StockReport)
+            .options(selectinload(StockReport.item).selectinload(InventoryItem.location))
+            .order_by(StockReport.created_at.desc())
+        )
+        if resolved is not None:
+            query = query.where(StockReport.resolved == resolved)
+        else:
+            query = query.where(StockReport.resolved == False)
+
+        result = await session.execute(query)
+        reports = result.scalars().all()
+        return [
+            {
+                "id": r.id,
+                "item_id": r.item_id,
+                "item_name": r.item.name if r.item else None,
+                "item_category": r.item.category if r.item else None,
+                "location_name": r.item.location.name if r.item and r.item.location else None,
+                "house_code": r.item.location.house_code if r.item and r.item.location else None,
+                "report_type": r.report_type,
+                "reported_by": r.reported_by,
+                "notes": r.notes,
+                "resolved": r.resolved,
+                "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in reports
+        ]
+
+
+@router.put("/inventory/reports/{report_id}/resolve")
+async def resolve_stock_report(report_id: int, request: Request):
+    """Mark a stock report as resolved."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(StockReport).where(StockReport.id == report_id)
+        )
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        report.resolved = True
+        report.resolved_at = datetime.utcnow()
+        return {"id": report_id, "resolved": True}
+
+
+@router.get("/inventory/shopping-list")
+async def get_shopping_list(request: Request):
+    """Get aggregated shopping list from unresolved stock reports."""
+    if request.state.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner access required")
+    async with get_session() as session:
+        result = await session.execute(
+            select(StockReport)
+            .options(selectinload(StockReport.item).selectinload(InventoryItem.location))
+            .where(StockReport.resolved == False)
+            .order_by(StockReport.created_at.asc())
+        )
+        reports = result.scalars().all()
+
+        # Aggregate by item (multiple reports for same item → one shopping list entry)
+        seen_items = {}
+        for r in reports:
+            if r.item_id not in seen_items:
+                seen_items[r.item_id] = {
+                    "item_id": r.item_id,
+                    "name": r.item.name if r.item else "Unknown",
+                    "category": r.item.category if r.item else None,
+                    "brand": r.item.brand if r.item else None,
+                    "purchase_url": r.item.purchase_url if r.item else None,
+                    "house_code": r.item.location.house_code if r.item and r.item.location else None,
+                    "location_name": r.item.location.name if r.item and r.item.location else None,
+                    "report_count": 0,
+                    "latest_report": None,
+                    "worst_status": "low",
+                    "report_ids": [],
+                }
+            entry = seen_items[r.item_id]
+            entry["report_count"] += 1
+            entry["report_ids"].append(r.id)
+            if r.created_at:
+                entry["latest_report"] = r.created_at.isoformat()
+            if r.report_type == "missing":
+                entry["worst_status"] = "missing"
+
+        return sorted(seen_items.values(), key=lambda x: (0 if x["worst_status"] == "missing" else 1, x["name"]))

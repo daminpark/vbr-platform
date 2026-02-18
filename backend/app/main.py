@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.db.database import init_db
 from app.services.ai_drafter import AIDrafter
 from app.services.hosttools import HostToolsClient
+from app.services.inventory_ai import InventoryAI
 from app.services.ntfy import NtfyClient
 
 # Paths — works both locally (backend/app/main.py → ../../frontend)
@@ -65,14 +66,17 @@ async def lifespan(app: FastAPI):
 
     # Init AI drafter
     ai_drafter = None
+    inventory_ai = None
     if settings.gemini_api_key:
         ai_drafter = AIDrafter(settings.gemini_api_key)
         logger.info("AI Drafter initialized (model: gemini-2.0-flash)")
+        inventory_ai = InventoryAI(settings.gemini_api_key)
+        logger.info("Inventory AI initialized (model: gemini-2.0-flash)")
     else:
-        logger.warning("GEMINI_API_KEY not set — AI drafts disabled")
+        logger.warning("GEMINI_API_KEY not set — AI drafts and inventory AI disabled")
 
     # Wire up services to routes
-    set_services(hosttools, ntfy, ai_drafter)
+    set_services(hosttools, ntfy, ai_drafter, inventory_ai)
 
     # Start background sync task
     sync_task = None

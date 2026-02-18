@@ -177,3 +177,102 @@ class ScheduledMessageLog(Base):
     reservation_id: Mapped[int] = mapped_column(ForeignKey("reservations.id"), index=True)
     sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     body_sent: Mapped[str] = mapped_column(Text)  # actual body after placeholder substitution
+
+
+# ---------------------------------------------------------------------------
+# Inventory management
+# ---------------------------------------------------------------------------
+
+class InventoryLocation(Base):
+    """A storage location within a property."""
+
+    __tablename__ = "inventory_locations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    house_code: Mapped[str] = mapped_column(String(10), index=True)  # "193", "195", "shared"
+    name: Mapped[str] = mapped_column(String(255))  # "Kitchen", "Toolshed"
+    code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, unique=True)  # "193.W", "195.Z"
+    parent_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("inventory_locations.id"), nullable=True, index=True
+    )
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # quirks, access notes
+    guest_accessible: Mapped[bool] = mapped_column(Boolean, default=False)
+    locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    outdoor: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    parent: Mapped[Optional["InventoryLocation"]] = relationship(
+        "InventoryLocation", remote_side="InventoryLocation.id", back_populates="children"
+    )
+    children: Mapped[list["InventoryLocation"]] = relationship(
+        "InventoryLocation", back_populates="parent"
+    )
+    items: Mapped[list["InventoryItem"]] = relationship(
+        "InventoryItem", back_populates="location"
+    )
+
+
+class InventoryItem(Base):
+    """An inventory item tracked across properties."""
+
+    __tablename__ = "inventory_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    category: Mapped[str] = mapped_column(String(100), index=True)  # cleaning, tools, linen, etc.
+    location_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("inventory_locations.id"), nullable=True, index=True
+    )
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    unit: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # bottles, packs, units
+    min_quantity: Mapped[int] = mapped_column(Integer, default=0)  # 0 = no low-stock alert
+
+    # AI-generated search aliases (comma-separated) for fast fuzzy search
+    search_aliases: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Product guide (future-ready)
+    product_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    usage_instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    suitable_for: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # "kitchen surfaces, tiles"
+
+    # Renovation support
+    status: Mapped[str] = mapped_column(String(20), default="in_use")  # in_use, out_for_renovation, retired
+
+    # Shopping
+    purchase_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Standard fields
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    location: Mapped[Optional["InventoryLocation"]] = relationship(
+        "InventoryLocation", back_populates="items"
+    )
+    stock_reports: Mapped[list["StockReport"]] = relationship(
+        "StockReport", back_populates="item", order_by="StockReport.created_at.desc()"
+    )
+
+
+class StockReport(Base):
+    """A stock report from a cleaner — item running low or missing."""
+
+    __tablename__ = "stock_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("inventory_items.id"), index=True)
+    report_type: Mapped[str] = mapped_column(String(20))  # "low", "missing"
+    reported_by: Mapped[str] = mapped_column(String(50), default="cleaner")  # role who reported
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    item: Mapped["InventoryItem"] = relationship("InventoryItem", back_populates="stock_reports")
