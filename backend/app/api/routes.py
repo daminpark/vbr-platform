@@ -1064,7 +1064,8 @@ async def get_inventory_locations(house_code: Optional[str] = None):
         query = (
             select(InventoryLocation)
             .options(
-                selectinload(InventoryLocation.children),
+                selectinload(InventoryLocation.children).selectinload(InventoryLocation.items),
+                selectinload(InventoryLocation.children).selectinload(InventoryLocation.children),
                 selectinload(InventoryLocation.items),
             )
             .where(InventoryLocation.active == True)

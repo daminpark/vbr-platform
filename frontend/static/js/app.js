@@ -1189,7 +1189,7 @@ function renderOwnerLocations(container) {
     if (state.invLocations.length === 0) {
         const empty = el('div', 'empty-state');
         empty.appendChild(el('div', 'empty-state-icon', '\uD83D\uDDC2\uFE0F'));
-        empty.appendChild(el('div', '', 'No locations. Seed them first.'));
+        empty.appendChild(el('div', '', 'No locations configured yet.'));
         container.appendChild(empty);
         return;
     }
