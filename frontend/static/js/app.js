@@ -28,6 +28,9 @@ const state = {
     invBulkPreview: null,
     invBulkLoading: false,
     invNlLoading: false,
+    invOwnerSearch: '',          // owner search query (client-side filter)
+    invOwnerSearchResults: null, // AI search results (when client-side has no matches)
+    invOwnerSearchLoading: false,
     invReportedIds: new Set(),  // items recently reported by cleaner (UI feedback)
 };
 
@@ -930,12 +933,36 @@ function renderOwnerInventory(app) {
 }
 
 function renderOwnerItemsList(container) {
-    // AI Input bar
+    // Search bar
+    const searchBar = el('div', 'inv-search-bar');
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.className = 'inv-search-input';
+    searchInput.placeholder = 'Search items... "drain stuff", "bleach"';
+    searchInput.value = state.invOwnerSearch;
+
+    let ownerSearchTimeout;
+    searchInput.addEventListener('input', () => {
+        state.invOwnerSearch = searchInput.value;
+        state.invOwnerSearchResults = null;
+        clearTimeout(ownerSearchTimeout);
+        ownerSearchTimeout = setTimeout(() => render(), 150);
+    });
+    searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && searchInput.value.trim().length >= 2) {
+            // On Enter, do AI search if local results are sparse
+            doOwnerSearch(searchInput.value.trim());
+        }
+    });
+    searchBar.appendChild(searchInput);
+    container.appendChild(searchBar);
+
+    // AI Input bar (add items)
     const inputBar = el('div', 'inv-ai-bar');
     const nlInput = document.createElement('input');
     nlInput.type = 'text';
     nlInput.className = 'inv-search-input';
-    nlInput.placeholder = 'Add naturally... "3 sponges in 195 kitchen"';
+    nlInput.placeholder = 'Add... "3 sponges in 195 kitchen"';
     nlInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') aiParseAndAdd(nlInput);
     });
@@ -950,6 +977,30 @@ function renderOwnerItemsList(container) {
         ld.appendChild(el('div', 'spinner'));
         ld.appendChild(el('span', '', 'Parsing...'));
         container.appendChild(ld);
+    }
+
+    // If AI search returned results, show those instead
+    if (state.invOwnerSearchLoading) {
+        const ld = el('div', 'loading');
+        ld.appendChild(el('div', 'spinner'));
+        ld.appendChild(el('span', '', 'AI searching...'));
+        container.appendChild(ld);
+        return;
+    }
+
+    if (state.invOwnerSearchResults !== null) {
+        const hint = el('div', 'inv-filters');
+        hint.appendChild(el('span', 'inv-count', state.invOwnerSearchResults.length + ' AI result' + (state.invOwnerSearchResults.length !== 1 ? 's' : '')));
+        const clearBtn = el('button', 'btn btn-ghost btn-sm', 'Clear');
+        clearBtn.addEventListener('click', () => {
+            state.invOwnerSearch = '';
+            state.invOwnerSearchResults = null;
+            render();
+        });
+        hint.appendChild(clearBtn);
+        container.appendChild(hint);
+        renderOwnerItemRows(container, state.invOwnerSearchResults);
+        return;
     }
 
     // Filter row
@@ -990,17 +1041,42 @@ function renderOwnerItemsList(container) {
     if (state.invFilter.category) {
         items = items.filter(i => i.category === state.invFilter.category);
     }
+
+    // Client-side search filter
+    const q = state.invOwnerSearch.trim().toLowerCase();
+    if (q.length >= 2) {
+        items = items.filter(i =>
+            i.name.toLowerCase().includes(q) ||
+            (i.category && i.category.toLowerCase().includes(q)) ||
+            (i.brand && i.brand.toLowerCase().includes(q)) ||
+            (i.location_name && i.location_name.toLowerCase().includes(q))
+        );
+    }
+
     countEl.textContent = items.length + ' item' + (items.length !== 1 ? 's' : '');
+
+    if (items.length === 0 && q.length >= 2) {
+        const empty = el('div', 'empty-state');
+        empty.appendChild(el('div', '', 'No local matches'));
+        const aiHint = el('div', 'inv-hint', 'Press Enter to AI search');
+        empty.appendChild(aiHint);
+        container.appendChild(empty);
+        return;
+    }
 
     if (items.length === 0) {
         const empty = el('div', 'empty-state');
         empty.appendChild(el('div', 'empty-state-icon', '\uD83D\uDCE6'));
         empty.appendChild(el('div', '', 'No items yet'));
-        empty.appendChild(el('div', 'inv-hint', 'Use Import tab or the input bar above to add items'));
+        empty.appendChild(el('div', 'inv-hint', 'Use Import tab or the add bar above'));
         container.appendChild(empty);
         return;
     }
 
+    renderOwnerItemRows(container, items);
+}
+
+function renderOwnerItemRows(container, items) {
     const list = el('div', 'inv-list');
     items.forEach(item => {
         const row = el('div', 'inv-item');
@@ -1304,6 +1380,23 @@ async function aiParseAndAdd(inputEl) {
         state.invNlLoading = false;
         render();
     }
+}
+
+async function doOwnerSearch(query) {
+    state.invOwnerSearchLoading = true;
+    render();
+
+    try {
+        state.invOwnerSearchResults = await api('/inventory/search', {
+            method: 'POST',
+            body: JSON.stringify({ query }),
+        });
+    } catch (e) {
+        console.error('Owner search failed:', e);
+        state.invOwnerSearchResults = [];
+    }
+    state.invOwnerSearchLoading = false;
+    render();
 }
 
 // ---------------------------------------------------------------------------
