@@ -871,25 +871,6 @@ function renderOwnerInventory(app) {
     // Header
     const header = el('div', 'header');
     header.appendChild(el('h1', '', 'Inventory'));
-    const actions = el('div', 'header-actions');
-
-    const seedBtn = el('button', 'btn btn-ghost btn-sm', '+ Seed Locations');
-    seedBtn.addEventListener('click', async () => {
-        try {
-            const result = await api('/inventory/locations/seed', { method: 'POST' });
-            if (result.seeded) {
-                alert('Seeded ' + result.count + ' locations');
-                loadInventory();
-            } else {
-                alert(result.message);
-            }
-        } catch (e) {
-            alert('Seed failed: ' + e.message);
-        }
-    });
-    if (state.invLocations.length === 0) actions.appendChild(seedBtn);
-
-    header.appendChild(actions);
     app.appendChild(header);
 
     // Sub-nav pills
